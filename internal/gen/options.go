@@ -1,11 +1,29 @@
 package gen
 
 import (
+	"encoding/binary"
 	"math"
 
 	"google.golang.org/protobuf/proto"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 )
+
+// varintUint64 reads a uint64 from the 8-byte little-endian varint data slice.
+func varintUint64(data []byte) uint64 {
+	if len(data) >= 8 {
+		return binary.LittleEndian.Uint64(data)
+	}
+	var val uint64
+	for i := range data {
+		val |= uint64(data[i]) << (i * 8)
+	}
+	return val
+}
+
+// varintBool reads a boolean from varint data.
+func varintBool(data []byte) bool {
+	return varintUint64(data) != 0
+}
 
 const extensionFieldNumber = 50100
 
@@ -51,7 +69,7 @@ func GetServiceOptions(opts *descriptorpb.ServiceOptions) *ServiceOptions {
 		case 1:
 			result.SubjectPrefix = string(data)
 		case 2:
-			result.Micro = len(data) > 0 && data[0] != 0
+			result.Micro = varintBool(data)
 		case 3:
 			result.Version = string(data)
 		case 4:
@@ -74,8 +92,8 @@ func GetMethodOptions(opts *descriptorpb.MethodOptions) *MethodOptions {
 	parseWireFormat(raw, func(fieldNum uint32, wireType int, data []byte) {
 		switch fieldNum {
 		case 1:
-			if wireType == 0 && len(data) > 0 {
-				result.Type = MethodType(data[0])
+			if wireType == 0 {
+				result.Type = MethodType(varintUint64(data))
 			}
 		case 2:
 			result.Subject = string(data)
@@ -100,7 +118,7 @@ func GetFieldOptions(opts *descriptorpb.FieldOptions) *FieldOptions {
 	result := &FieldOptions{}
 	parseWireFormat(raw, func(fieldNum uint32, wireType int, data []byte) {
 		if fieldNum == 1 {
-			result.SubjectToken = len(data) > 0 && data[0] != 0
+			result.SubjectToken = varintBool(data)
 		}
 	})
 	return result
@@ -168,7 +186,17 @@ func parseWireFormat(b []byte, handler func(fieldNum uint32, wireType int, data 
 			if vn < 0 {
 				return
 			}
-			handler(num, 0, []byte{byte(val)})
+			// Encode the full uint64 value as little-endian bytes.
+			vBytes := make([]byte, 8)
+			vBytes[0] = byte(val)
+			vBytes[1] = byte(val >> 8)
+			vBytes[2] = byte(val >> 16)
+			vBytes[3] = byte(val >> 24)
+			vBytes[4] = byte(val >> 32)
+			vBytes[5] = byte(val >> 40)
+			vBytes[6] = byte(val >> 48)
+			vBytes[7] = byte(val >> 56)
+			handler(num, 0, vBytes)
 			b = b[vn:]
 		case 2: // length-delimited
 			length, vn := consumeVarint(b)
