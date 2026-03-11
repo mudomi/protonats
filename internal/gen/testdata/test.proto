@@ -1,7 +1,7 @@
 syntax = "proto3";
 package testpkg;
 
-option go_package = "github.com/you/protonats/internal/gen/testdata/gen;testgen";
+option go_package = "github.com/mudomi/protonats/internal/gen/testdata/gen;testgen";
 
 import "google/protobuf/empty.proto";
 import "protonats/options.proto";

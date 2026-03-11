@@ -1,6 +1,6 @@
 # ProtoNats
 
-[![CI](https://github.com/you/protonats/actions/workflows/ci.yml/badge.svg)](https://github.com/you/protonats/actions/workflows/ci.yml)
+[![CI](https://github.com/mudomi/protonats/actions/workflows/ci.yml/badge.svg)](https://github.com/mudomi/protonats/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 A protoc plugin and Go runtime that generates type-safe [NATS](https://nats.io) clients and handlers from Protocol Buffer service definitions.
@@ -27,13 +27,13 @@ reg, _ := orders.RegisterOrderServiceHandler(pn, &handler{})
 ## Install
 
 ```bash
-go install github.com/you/protonats/cmd/protoc-gen-protonats@latest
+go install github.com/mudomi/protonats/cmd/protoc-gen-protonats@latest
 ```
 
 Add the runtime library to your project:
 
 ```bash
-go get github.com/you/protonats
+go get github.com/mudomi/protonats
 ```
 
 You also need [protoc](https://github.com/protocolbuffers/protobuf/releases) and [protoc-gen-go](https://pkg.go.dev/google.golang.org/protobuf/cmd/protoc-gen-go):
@@ -90,7 +90,7 @@ This produces two files:
 ```go
 import (
     "github.com/nats-io/nats.go"
-    "github.com/you/protonats"
+    "github.com/mudomi/protonats"
 )
 
 nc, _ := nats.Connect("nats://localhost:4222")

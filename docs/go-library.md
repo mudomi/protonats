@@ -5,8 +5,8 @@ This document describes how to use the generated Go code and the `protonats` run
 ## Installation
 
 ```bash
-go get github.com/you/protonats
-go install github.com/you/protonats/cmd/protoc-gen-protonats@latest
+go get github.com/mudomi/protonats
+go install github.com/mudomi/protonats/cmd/protoc-gen-protonats@latest
 ```
 
 ## Code Generation
@@ -32,7 +32,7 @@ ProtoNats wraps a `*nats.Conn`. It does not own the connection -- you create it,
 ```go
 import (
     "github.com/nats-io/nats.go"
-    "github.com/you/protonats"
+    "github.com/mudomi/protonats"
 )
 
 func main() {

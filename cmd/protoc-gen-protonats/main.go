@@ -3,7 +3,7 @@ package main
 import (
 	"google.golang.org/protobuf/compiler/protogen"
 
-	"github.com/you/protonats/internal/gen"
+	"github.com/mudomi/protonats/internal/gen"
 )
 
 func main() {

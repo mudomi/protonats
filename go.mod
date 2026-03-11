@@ -1,4 +1,4 @@
-module github.com/you/protonats
+module github.com/mudomi/protonats
 
 go 1.22
 

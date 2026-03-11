@@ -8,7 +8,7 @@ import (
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 )
 
-const runtimePackage = "github.com/you/protonats"
+const runtimePackage = "github.com/mudomi/protonats"
 
 // GenerateFile produces a _protonats.pb.go file for each proto file with services.
 func GenerateFile(plugin *protogen.Plugin, file *protogen.File) {
