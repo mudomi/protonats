@@ -1,0 +1,78 @@
+syntax = "proto3";
+package protonats;
+
+option go_package = "github.com/you/protonats/proto/protonats;protonats";
+
+import "google/protobuf/descriptor.proto";
+
+// Service-level options.
+message ServiceOptions {
+  // Subject prefix for all methods. Default: proto package name.
+  string subject_prefix = 1;
+
+  // Enable NATS micro service discovery.
+  bool micro = 2;
+
+  // Service version for micro discovery (semver). Required if micro is true.
+  string version = 3;
+
+  // Human-readable description for micro discovery.
+  string description = 4;
+}
+
+extend google.protobuf.ServiceOptions {
+  optional ServiceOptions service = 50100;
+}
+
+// Method-level options.
+message MethodOptions {
+  // Communication pattern. Default: REQUEST_REPLY.
+  MethodType type = 1;
+
+  // NATS subject override. Supports {field_name} interpolation.
+  string subject = 2;
+
+  // JetStream stream name. Required for JETSTREAM_PUBLISH / JETSTREAM_CONSUME.
+  string stream = 3;
+
+  // Durable consumer name for JETSTREAM_CONSUME.
+  string consumer = 4;
+}
+
+extend google.protobuf.MethodOptions {
+  optional MethodOptions method = 50100;
+}
+
+enum MethodType {
+  REQUEST_REPLY = 0;
+  PUBLISH = 1;
+  JETSTREAM_PUBLISH = 2;
+  JETSTREAM_CONSUME = 3;
+}
+
+// Field-level options.
+message FieldOptions {
+  // Marks this field as a dynamic NATS subject token.
+  bool subject_token = 1;
+}
+
+extend google.protobuf.FieldOptions {
+  optional FieldOptions field = 50100;
+}
+
+// Message-level options.
+message MessageOptions {
+  KVOptions kv = 1;
+}
+
+message KVOptions {
+  // KV bucket name.
+  string bucket = 1;
+
+  // Key template using {field_name} interpolation.
+  string key_template = 2;
+}
+
+extend google.protobuf.MessageOptions {
+  optional MessageOptions message = 50100;
+}

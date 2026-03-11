@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y unzip
+          PROTOC_VERSION=28.3
+          curl -sLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local bin/protoc 'include/*'
+          rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+
+      - name: Install protoc-gen-go
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+
+      - name: Build protoc-gen-protonats
+        run: go build -o protoc-gen-protonats ./cmd/protoc-gen-protonats
+
+      - name: Run protoc plugin on test proto
+        run: |
+          export PATH="$PWD:$PATH"
+          mkdir -p internal/gen/testdata/gen
+          protoc \
+            --go_out=internal/gen/testdata/gen --go_opt=paths=source_relative \
+            --protonats_out=internal/gen/testdata/gen --protonats_opt=paths=source_relative \
+            -I proto \
+            -I internal/gen/testdata \
+            internal/gen/testdata/test.proto
+          echo "Generated files:"
+          ls -la internal/gen/testdata/gen/
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Check coverage
+        run: go tool cover -func=coverage.out

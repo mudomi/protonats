@@ -1,0 +1,79 @@
+syntax = "proto3";
+package testpkg;
+
+option go_package = "github.com/you/protonats/internal/gen/testdata/gen;testgen";
+
+import "google/protobuf/empty.proto";
+import "protonats/options.proto";
+
+service TestService {
+  // Default request/reply — no options needed
+  rpc Echo(EchoRequest) returns (EchoResponse);
+
+  // Custom subject with dynamic segment
+  rpc GetItem(GetItemRequest) returns (Item) {
+    option (protonats.method).subject = "items.{item_id}";
+  }
+
+  // Fire-and-forget publish
+  rpc Notify(NotifyRequest) returns (google.protobuf.Empty) {
+    option (protonats.method).type = PUBLISH;
+  }
+
+  // JetStream publish
+  rpc EmitEvent(EventPayload) returns (google.protobuf.Empty) {
+    option (protonats.method) = {
+      type: JETSTREAM_PUBLISH
+      stream: "EVENTS"
+    };
+  }
+
+  // JetStream consume (handler-only)
+  rpc ProcessEvent(EventPayload) returns (google.protobuf.Empty) {
+    option (protonats.method) = {
+      type: JETSTREAM_CONSUME
+      stream: "EVENTS"
+      consumer: "event-processor"
+    };
+  }
+}
+
+// Service with custom subject prefix
+service PrefixedService {
+  option (protonats.service) = {
+    subject_prefix: "custom.prefix"
+  };
+
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}
+
+message GetItemRequest {
+  string item_id = 1 [(protonats.field).subject_token = true];
+}
+
+message Item {
+  string item_id = 1;
+  string name = 2;
+}
+
+message NotifyRequest {
+  string text = 1;
+}
+
+message EventPayload {
+  string event_id = 1;
+  string data = 2;
+}
+
+message PingRequest {}
+message PingResponse {
+  string pong = 1;
+}
