@@ -27,7 +27,7 @@ All options live under the `protonats` package using extension number `50100` (w
 syntax = "proto3";
 package protonats;
 
-option go_package = "github.com/mudomi/protonats/options;options";
+option go_package = "github.com/mudomi/protonats;protonats";
 
 import "google/protobuf/descriptor.proto";
 

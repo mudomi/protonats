@@ -49,20 +49,22 @@ func TestSnakeToCamel(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
-		{"order_id", "OrderID"},
-		{"customer_id", "CustomerID"},
+		{"order_id", "OrderId"},
+		{"customer_id", "CustomerId"},
 		{"event_type", "EventType"},
 		{"name", "Name"},
 		{"display_name", "DisplayName"},
-		{"url", "URL"},
-		{"api_url", "APIURL"},
-		{"ip", "IP"},
-		{"http", "HTTP"},
-		{"api", "API"},
+		{"url", "Url"},
+		{"api_url", "ApiUrl"},
+		{"ip", "Ip"},
+		{"http", "Http"},
+		{"api", "Api"},
 		{"", ""},
 		{"a", "A"},
-		{"user_api_url", "UserAPIURL"},
-		{"ip_address", "IPAddress"},
+		{"user_api_url", "UserApiUrl"},
+		{"ip_address", "IpAddress"},
+		{"warehouse_id", "WarehouseId"},
+		{"product_id", "ProductId"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {

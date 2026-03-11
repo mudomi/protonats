@@ -203,6 +203,7 @@ proto/protonats/            options.proto definition
 - [Design Overview](./docs/design.md) — architecture, philosophy, patterns
 - [Proto Definition Guide](./docs/proto-definition.md) — writing `.proto` files for ProtoNats
 - [Go Library Guide](./docs/go-library.md) — using generated code and the runtime
+- [Docker Usage](./docs/docker.md) — using the Docker image locally and in CI
 
 ## License
 
