@@ -1,6 +1,7 @@
 # ProtoNats
 
 [![CI](https://github.com/mudomi/protonats/actions/workflows/ci.yml/badge.svg)](https://github.com/mudomi/protonats/actions/workflows/ci.yml)
+[![Docker](https://github.com/mudomi/protonats/actions/workflows/docker.yml/badge.svg)](https://github.com/mudomi/protonats/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 A protoc plugin and Go runtime that generates type-safe [NATS](https://nats.io) clients and handlers from Protocol Buffer service definitions.
@@ -42,6 +43,12 @@ You also need [protoc](https://github.com/protocolbuffers/protobuf/releases) and
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 ```
 
+Or use the Docker image which bundles everything:
+
+```bash
+docker pull ghcr.io/mudomi/protonats
+```
+
 ## Quick Start
 
 ### 1. Define your service in a `.proto` file
@@ -73,12 +80,24 @@ Copy `proto/protonats/options.proto` from this repo into your proto include path
 
 ### 2. Generate code
 
+With local tools:
+
 ```bash
 protoc \
   --go_out=gen --go_opt=paths=source_relative \
   --protonats_out=gen --protonats_opt=paths=source_relative \
   -I proto \
   proto/myapp/orders/orders.proto
+```
+
+Or with Docker (no local installs needed):
+
+```bash
+docker run --rm -v $(pwd):/work ghcr.io/mudomi/protonats \
+  --go_out=/work/gen --go_opt=paths=source_relative \
+  --protonats_out=/work/gen --protonats_opt=paths=source_relative \
+  -I /work/proto \
+  /work/proto/myapp/orders/orders.proto
 ```
 
 This produces two files:
