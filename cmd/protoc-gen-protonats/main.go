@@ -1,0 +1,18 @@
+package main
+
+import (
+	"google.golang.org/protobuf/compiler/protogen"
+
+	"github.com/you/protonats/internal/gen"
+)
+
+func main() {
+	protogen.Options{}.Run(func(plugin *protogen.Plugin) error {
+		for _, file := range plugin.Files {
+			if file.Generate {
+				gen.GenerateFile(plugin, file)
+			}
+		}
+		return nil
+	})
+}

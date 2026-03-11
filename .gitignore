@@ -1,5 +1,5 @@
 # Binaries
-protoc-gen-protonats
+/protoc-gen-protonats
 *.exe
 
 # IDE
