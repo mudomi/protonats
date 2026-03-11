@@ -49,22 +49,54 @@ func TestSnakeToCamel(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
+		// Simple single-word fields
+		{"name", "Name"},
+		{"status", "Status"},
+		{"a", "A"},
+		{"", ""},
+
+		// Common _id suffix fields — proto uses "Id" not "ID"
 		{"order_id", "OrderId"},
 		{"customer_id", "CustomerId"},
+		{"warehouse_id", "WarehouseId"},
+		{"product_id", "ProductId"},
+		{"user_id", "UserId"},
+		{"tenant_id", "TenantId"},
+		{"reservation_id", "ReservationId"},
+		{"id", "Id"},
+
+		// Multi-word fields
 		{"event_type", "EventType"},
-		{"name", "Name"},
 		{"display_name", "DisplayName"},
+		{"created_at", "CreatedAt"},
+		{"updated_at", "UpdatedAt"},
+		{"price_cents", "PriceCents"},
+		{"max_retries", "MaxRetries"},
+		{"is_active", "IsActive"},
+
+		// Acronym-like words — proto does NOT uppercase them
 		{"url", "Url"},
 		{"api_url", "ApiUrl"},
 		{"ip", "Ip"},
-		{"http", "Http"},
-		{"api", "Api"},
-		{"", ""},
-		{"a", "A"},
-		{"user_api_url", "UserApiUrl"},
 		{"ip_address", "IpAddress"},
-		{"warehouse_id", "WarehouseId"},
-		{"product_id", "ProductId"},
+		{"http", "Http"},
+		{"http_method", "HttpMethod"},
+		{"api", "Api"},
+		{"api_key", "ApiKey"},
+		{"user_api_url", "UserApiUrl"},
+		{"ssl_enabled", "SslEnabled"},
+		{"tcp_port", "TcpPort"},
+
+		// Three or more segments
+		{"first_middle_last", "FirstMiddleLast"},
+		{"max_ack_pending", "MaxAckPending"},
+		{"x_request_id", "XRequestId"},
+		{"content_type_json", "ContentTypeJson"},
+
+		// Leading/trailing/double underscores
+		{"_leading", "Leading"},
+		{"trailing_", "Trailing"},
+		{"double__underscore", "DoubleUnderscore"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
