@@ -1,6 +1,11 @@
 # Binaries
 /protoc-gen-protonats
+/protoc-gen-protonats-ts
 *.exe
+
+# TypeScript
+ts/runtime/dist/
+ts/runtime/node_modules/
 
 # IDE
 .idea/

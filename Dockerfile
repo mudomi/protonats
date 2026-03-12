@@ -14,7 +14,8 @@ RUN CGO_ENABLED=0 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 
 COPY . /src
 WORKDIR /src
-RUN CGO_ENABLED=0 go build -trimpath -o /out/bin/protoc-gen-protonats ./cmd/protoc-gen-protonats
+RUN CGO_ENABLED=0 go build -trimpath -o /out/bin/protoc-gen-protonats ./cmd/protoc-gen-protonats \
+    && CGO_ENABLED=0 go build -trimpath -o /out/bin/protoc-gen-protonats-ts ./cmd/protoc-gen-protonats-ts
 
 COPY proto/protonats /out/include/protonats
 

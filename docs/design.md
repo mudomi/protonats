@@ -74,8 +74,6 @@ These patterns are too varied or operational to warrant code generation. ProtoNa
 | **Complex stream topologies** | Mirrors, sources, subject transforms -- infrastructure config, not service definitions. |
 | **Batch publishing** | Highly application-specific batching logic. |
 
-Note: Request-Many was originally Tier 1 but was moved here. The runtime library provides a generic `protonats.RequestMany[T]()` helper for when you need it, but it doesn't warrant a separate method type in the proto definition.
-
 ## Subject Naming
 
 ProtoNats derives NATS subjects from the proto package and method name by default:

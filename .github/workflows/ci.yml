@@ -37,6 +37,9 @@ jobs:
       - name: Build protoc-gen-protonats
         run: go build -o protoc-gen-protonats ./cmd/protoc-gen-protonats
 
+      - name: Build protoc-gen-protonats-ts
+        run: go build -o protoc-gen-protonats-ts ./cmd/protoc-gen-protonats-ts
+
       - name: Run protoc plugin on test proto
         run: |
           export PATH="$PWD:$PATH"
@@ -47,8 +50,20 @@ jobs:
             -I proto \
             -I internal/gen/testdata \
             internal/gen/testdata/test.proto
-          echo "Generated files:"
+          echo "Generated Go files:"
           ls -la internal/gen/testdata/gen/
+
+      - name: Run protoc TS plugin on test proto
+        run: |
+          export PATH="$PWD:$PATH"
+          mkdir -p internal/gents/testdata/gen
+          protoc \
+            --protonats-ts_out=internal/gents/testdata/gen --protonats-ts_opt=paths=source_relative \
+            -I proto \
+            -I internal/gen/testdata \
+            internal/gen/testdata/test.proto
+          echo "Generated TS files:"
+          ls -la internal/gents/testdata/gen/
 
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out ./...

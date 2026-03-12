@@ -189,15 +189,6 @@ if errors.As(err, &pnErr) {
 }
 ```
 
-## Project Structure
-
-```
-cmd/protoc-gen-protonats/   protoc plugin binary
-internal/gen/               code generation logic
-proto/protonats/            options.proto definition
-*.go                        runtime library (package protonats)
-```
-
 ## Documentation
 
 - [Design Overview](./docs/design.md) — architecture, philosophy, patterns
