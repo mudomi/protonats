@@ -36,11 +36,28 @@ ProtoNats also does not try to wrap every NATS feature. For things like object s
                                 │
                                 ▼
                           nats.go client
+
+
+                          protoc
+  .proto files ──────────────────────────> Generated TypeScript code
+  (same files)            protoc-gen-es          (types + schemas)
+                          protoc-gen-protonats-ts (clients, handlers, subjects)
+                                │
+                                ▼
+                         TS runtime library
+                         (@protonats/runtime)
+                                │
+                                ▼
+                          nats.js client
 ```
 
+Both Go and TypeScript sides use binary protobuf over NATS with identical subjects and error headers (`Nats-Service-Error` / `Nats-Service-Error-Code`), so a Go handler can serve a TypeScript client and vice versa.
+
 1. **`protonats/options.proto`** - Proto file defining custom options (service, method, field, message level)
-2. **`protoc-gen-protonats`** - Protoc plugin that reads proto files and generates Go code
-3. **`protonats` Go package** - Runtime library providing connection management, middleware, and helpers
+2. **`protoc-gen-protonats`** - Protoc plugin that generates Go code
+3. **`protonats` Go package** - Go runtime library providing connection management, middleware, and helpers
+4. **`protoc-gen-protonats-ts`** - Protoc plugin that generates TypeScript code
+5. **`@protonats/runtime`** - TypeScript runtime library wrapping nats.js with protobuf serialization
 
 ## Supported Communication Patterns
 
@@ -101,8 +118,10 @@ This default can be overridden at every level (service prefix, method subject) v
 ProtoNats follows the NATS Service API convention (`Nats-Service-Error` / `Nats-Service-Error-Code` headers). This means:
 
 - Any NATS tooling that understands the Service API can interpret ProtoNats errors.
-- The generated client checks these headers and returns structured Go errors.
-- Handlers return errors via `protonats.Errorf(code, format, args...)`.
+- The generated Go client checks these headers and returns structured `*protonats.Error` values.
+- The generated TS client checks these headers and throws `ProtoNatsError` instances.
+- Go handlers return errors via `protonats.Errorf(code, format, args...)`.
+- TS handlers throw `new ProtoNatsError(code, message)`.
 - For JetStream: standard ack semantics (Ack/Nak/Term) apply.
 
 ## Middleware / Interceptors

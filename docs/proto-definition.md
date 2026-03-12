@@ -635,9 +635,24 @@ Generated Go code:
 gen/
   myapp/
     orders/
-      orders.pb.go           # Standard protobuf types
-      orders_protonats.pb.go # ProtoNats clients, handlers, subjects
+      orders.pb.go           # Standard protobuf types (protoc-gen-go)
+      orders_protonats.pb.go # ProtoNats clients, handlers, subjects (protoc-gen-protonats)
     users/
       users.pb.go
       users_protonats.pb.go
 ```
+
+Generated TypeScript code:
+
+```
+gen-ts/
+  myapp/
+    orders/
+      orders_pb.ts           # Protobuf types + schemas (protoc-gen-es)
+      orders_protonats.ts    # ProtoNats clients, handlers, register (protoc-gen-protonats-ts)
+    users/
+      users_pb.ts
+      users_protonats.ts
+```
+
+The TypeScript output requires two protoc plugins: `protoc-gen-es` (from the Buf team) generates the message types and schema descriptors, and `protoc-gen-protonats-ts` generates the ProtoNats client/handler code that imports from them. See the [TypeScript Library Guide](ts-library.md) for setup and usage.
