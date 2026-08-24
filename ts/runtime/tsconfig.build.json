@@ -1,0 +1,7 @@
+// Build config: same settings, minus the tests, so they stay out of dist/.
+// The base tsconfig.json still includes them so `npm run typecheck` (and
+// editors) type-check the test files — vitest itself does not.
+{
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts"]
+}

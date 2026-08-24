@@ -4,7 +4,7 @@
 import type { HandlerContext, CallOptions, HandlerOptions } from "@protonats/runtime";
 import { ProtoNatsConn, Registration, encode } from "@protonats/runtime";
 
-import { type EchoRequest, type EchoResponse, type GetItemRequest, type Item, type NotifyRequest, type EventPayload, type PingRequest, type PingResponse, EchoRequestSchema, EchoResponseSchema, GetItemRequestSchema, ItemSchema, NotifyRequestSchema, EventPayloadSchema, PingRequestSchema, PingResponseSchema } from "./test_pb.js";
+import { type EchoRequest, type EchoResponse, type GetItemRequest, type Item, type NotifyRequest, type PingRequest, type PingResponse, EchoRequestSchema, EchoResponseSchema, GetItemRequestSchema, ItemSchema, NotifyRequestSchema, PingRequestSchema, PingResponseSchema } from "./test_pb.js";
 
 export class TestServiceClient {
   constructor(private readonly pn: ProtoNatsConn) {}
@@ -21,9 +21,8 @@ export class TestServiceClient {
     this.pn.publish("testpkg.Notify", req, NotifyRequestSchema, opts);
   }
 
-  emitEvent(req: EventPayload, opts?: CallOptions): void {
-    this.pn.publish("testpkg.EmitEvent", req, EventPayloadSchema, opts);
-  }
+  // EmitEvent (JETSTREAM_PUBLISH) is not generated: the TS runtime
+  // does not support JetStream; use the nats.js JetStream API directly.
 
 }
 
@@ -31,7 +30,9 @@ export interface TestServiceHandler {
   echo(ctx: HandlerContext, req: EchoRequest): Promise<EchoResponse>;
   getItem(ctx: HandlerContext, req: GetItemRequest): Promise<Item>;
   notify(ctx: HandlerContext, req: NotifyRequest): Promise<void>;
-  processEvent(ctx: HandlerContext, req: EventPayload): Promise<void>;
+  // ProcessEvent (JETSTREAM_CONSUME) is not generated: the TS runtime
+  // does not support JetStream; use the nats.js JetStream API directly.
+
 }
 
 export function registerTestServiceHandler(
@@ -43,6 +44,7 @@ export function registerTestServiceHandler(
 
   reg.addSubscription(
     pn.subscribe(
+      "testpkg.TestService.Echo",
       "testpkg.Echo",
       opts?.queueGroup,
       EchoRequestSchema,
@@ -55,6 +57,7 @@ export function registerTestServiceHandler(
 
   reg.addSubscription(
     pn.subscribe(
+      "testpkg.TestService.GetItem",
       "items.*",
       opts?.queueGroup,
       GetItemRequestSchema,
@@ -67,6 +70,7 @@ export function registerTestServiceHandler(
 
   reg.addSubscription(
     pn.subscribePublish(
+      "testpkg.TestService.Notify",
       "testpkg.Notify",
       opts?.queueGroup,
       NotifyRequestSchema,
@@ -101,6 +105,7 @@ export function registerPrefixedServiceHandler(
 
   reg.addSubscription(
     pn.subscribe(
+      "testpkg.PrefixedService.Ping",
       "custom.prefix.Ping",
       opts?.queueGroup,
       PingRequestSchema,

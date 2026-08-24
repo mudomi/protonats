@@ -42,7 +42,6 @@ func TestCallOptions_Compose(t *testing.T) {
 	assert.Equal(t, "test", co.subject)
 }
 
-
 // Edge cases
 
 func TestCallOptions_ZeroTimeout(t *testing.T) {
@@ -116,4 +115,15 @@ func TestCallOptions_SubjectOverride(t *testing.T) {
 		WithSubject("second"),
 	})
 	assert.Equal(t, "second", co.subject)
+}
+
+func TestCallOptions_WithMethodName(t *testing.T) {
+	co := applyCallOptions([]CallOption{WithMethodName("pkg.Svc.Do")})
+	assert.Equal(t, "pkg.Svc.Do", co.method)
+	assert.Equal(t, "pkg.Svc.Do", co.methodOr("subject"))
+}
+
+func TestCallOptions_MethodDefaultsToSubject(t *testing.T) {
+	var co callOptions
+	assert.Equal(t, "the.subject", co.methodOr("the.subject"))
 }

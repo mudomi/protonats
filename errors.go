@@ -43,10 +43,18 @@ func setErrorHeaders(h nats.Header, err error) {
 }
 
 func errorFromHeaders(h nats.Header) error {
-	msg := h.Get(headerError)
-	if msg == "" {
+	// Presence of the header, not its value, marks a failure: a handler may
+	// return an error whose message is empty, and testing the value would
+	// hand the caller a zero-valued response and a nil error instead.
+	values, failed := h[headerError]
+	if !failed {
 		return nil
 	}
+	var msg string
+	if len(values) > 0 {
+		msg = values[0]
+	}
+
 	code := 500
 	if c := h.Get(headerErrorCode); c != "" {
 		if parsed, err := strconv.Atoi(c); err == nil {

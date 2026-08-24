@@ -10,7 +10,8 @@ message ServiceOptions {
   // Subject prefix for all methods. Default: proto package name.
   string subject_prefix = 1;
 
-  // Enable NATS micro service discovery.
+  // ROADMAP — not yet implemented; the plugin fails when set.
+  // Reserved for NATS micro service discovery.
   bool micro = 2;
 
   // Service version for micro discovery (semver). Required if micro is true.
@@ -62,6 +63,8 @@ extend google.protobuf.FieldOptions {
 
 // Message-level options.
 message MessageOptions {
+  // ROADMAP — not yet implemented; the plugin fails when set.
+  // Reserved for typed KV store helpers.
   KVOptions kv = 1;
 }
 

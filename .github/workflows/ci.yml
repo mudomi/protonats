@@ -10,11 +10,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
+    env:
+      # Turns "NATS unreachable" from a skip into a failure. Without it a
+      # server that never starts would leave the whole behavioral suite
+      # skipped and the build green.
+      PROTONATS_REQUIRE_NATS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+
+      # A service container cannot take a command, and the e2e tests need
+      # JetStream (-js), so run the server directly and wait for the port.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 nats:latest -js
+          for i in $(seq 1 30); do
+            if nc -z localhost 4222; then echo "NATS ready"; exit 0; fi
+            sleep 1
+          done
+          echo "NATS did not become ready"; docker logs nats; exit 1
 
       - name: Install protoc
         run: |
@@ -31,42 +42,42 @@ jobs:
           sudo unzip -o "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local bin/protoc 'include/*'
           rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
 
-      - name: Install protoc-gen-go
-        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+      - name: Build plugins
+        run: |
+          go build -o protoc-gen-protonats ./cmd/protoc-gen-protonats
+          go build -o protoc-gen-protonats-ts ./cmd/protoc-gen-protonats-ts
 
-      - name: Build protoc-gen-protonats
-        run: go build -o protoc-gen-protonats ./cmd/protoc-gen-protonats
-
-      - name: Build protoc-gen-protonats-ts
-        run: go build -o protoc-gen-protonats-ts ./cmd/protoc-gen-protonats-ts
-
-      - name: Run protoc plugin on test proto
+      # Regenerate into a scratch dir and diff against the checked-in output,
+      # so the committed generated code can never drift from the plugins.
+      - name: Check generated code is up to date
         run: |
           export PATH="$PWD:$PATH"
-          mkdir -p internal/gen/testdata/gen
+          mkdir -p /tmp/gen-check
           protoc \
-            --go_out=internal/gen/testdata/gen --go_opt=paths=source_relative \
-            --protonats_out=internal/gen/testdata/gen --protonats_opt=paths=source_relative \
+            --protonats_out=/tmp/gen-check --protonats_opt=paths=source_relative \
+            --protonats-ts_out=/tmp/gen-check --protonats-ts_opt=paths=source_relative \
             -I proto \
             -I internal/gen/testdata \
             internal/gen/testdata/test.proto
-          echo "Generated Go files:"
-          ls -la internal/gen/testdata/gen/
+          diff -u internal/gen/testdata/gen/test_protonats.pb.go /tmp/gen-check/test_protonats.pb.go
+          diff -u internal/gents/testdata/snapshots/test_protonats.ts /tmp/gen-check/test_protonats.ts
 
-      - name: Run protoc TS plugin on test proto
-        run: |
-          export PATH="$PWD:$PATH"
-          mkdir -p internal/gents/testdata/gen
-          protoc \
-            --protonats-ts_out=internal/gents/testdata/gen --protonats-ts_opt=paths=source_relative \
-            -I proto \
-            -I internal/gen/testdata \
-            internal/gen/testdata/test.proto
-          echo "Generated TS files:"
-          ls -la internal/gents/testdata/gen/
-
-      - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out ./...
+      # -coverpkg spans packages so the runtime code exercised by internal/e2e
+      # is credited; without it the JetStream code reads as 0%.
+      - name: Run Go tests
+        run: go test -v -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Check coverage
-        run: go tool cover -func=coverage.out
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test and build TS runtime
+        working-directory: ts/runtime
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build

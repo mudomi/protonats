@@ -31,8 +31,11 @@ export function setErrorHeaders(headers: MsgHdrs, err: unknown): void {
 /** Read error information from NATS headers. Returns null if no error. */
 export function errorFromHeaders(h: MsgHdrs | undefined): ProtoNatsError | null {
   if (!h) return null;
+  // Presence of the header, not its value, marks a failure: a handler may
+  // return an error whose message is empty, and testing the value would hand
+  // the caller a zero-valued response and no error instead.
+  if (!h.has(HEADER_ERROR)) return null;
   const msg = h.get(HEADER_ERROR);
-  if (!msg) return null;
   const codeStr = h.get(HEADER_ERROR_CODE);
   const code = codeStr ? parseInt(codeStr, 10) : 500;
   return new ProtoNatsError(isNaN(code) ? 500 : code, msg);

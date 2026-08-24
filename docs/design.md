@@ -1,134 +1,69 @@
-# ProtoNats Design Overview
+# Design Notes
+
+Rationale and scope. For usage see the [README](../README.md) and the
+language guides.
 
 ## Philosophy
 
-ProtoNats makes the common case trivial and the complex case possible. For a simple request/response or publish/subscribe, the developer writes a proto service definition and gets generated Go code where sending a message is a single function call and receiving one is a single handler function. No manual subject construction, no manual serialization, no boilerplate.
+Make the common case trivial and the complex case possible. A request/response
+or publish should be one function call to send and one function to implement,
+with no manual subject building or serialization — and when you need queue
+groups, dynamic subjects, JetStream tuning, or raw NATS, there is an escape
+hatch at every level that does not require abandoning the generated code.
 
-When you need more control -- custom queue groups, dynamic subjects, raw NATS access, JetStream tuning -- ProtoNats exposes escape hatches at every level without forcing you to abandon the generated code.
+Following gRPC, Twirp, and ConnectRPC, options are a last resort: if none are
+set, the generated code still works. They exist only for what a standard proto
+schema cannot express — subject routing and the communication pattern.
 
-### Convention Over Configuration
+## Not gRPC over NATS
 
-Most successful protoc plugins (gRPC, Twirp, ConnectRPC) use zero custom proto options. They derive everything from standard `service`/`rpc` definitions. ProtoNats follows this principle: **if no options are set, the generated code still works.** Custom options exist only for things that standard proto schema cannot express (NATS subject routing, communication pattern selection).
-
-### Keep Operational Config Out of Proto
-
-Proto files define the **API contract** -- what messages look like, what operations exist, what subjects they route to. Proto files do **not** define operational parameters like timeouts, retry counts, consumer buffer sizes, or queue group names. Those change between environments and belong in runtime configuration.
-
-The line: if changing a value requires regenerating code and redeploying, it probably shouldn't be in the proto file.
-
-## What ProtoNats Is Not
-
-ProtoNats is **not gRPC over NATS**. gRPC assumes point-to-point HTTP/2 connections with bidirectional streams. NATS is a fundamentally different messaging topology: pub/sub, fan-out, queue groups, persistence via JetStream, key-value stores, and more. ProtoNats embraces NATS-native patterns rather than shoehorning gRPC semantics.
-
-ProtoNats also does not try to wrap every NATS feature. For things like object stores, complex KV operations, or direct JetStream stream management, you use the NATS Go client directly. ProtoNats exposes the underlying `*nats.Conn` and `jetstream.JetStream` handles so you can always drop down.
+gRPC assumes point-to-point HTTP/2 connections with bidirectional streams. NATS
+is a different topology: pub/sub, fan-out, queue groups, persistence through
+JetStream, key-value. ProtoNats targets NATS-native patterns rather than
+reshaping them into gRPC semantics, which is why there is no streaming and why
+publish and JetStream are first-class method types.
 
 ## Components
 
 ```
-                          protoc
-  .proto files ──────────────────────────> Generated Go code
-  (messages + services    protoc-gen-go         (types)
-   + protonats options)   protoc-gen-protonats   (clients, handlers, subjects)
-                                │
-                                ▼
-                         Go runtime library
-                         (protonats package)
-                                │
-                                ▼
-                          nats.go client
-
-
-                          protoc
-  .proto files ──────────────────────────> Generated TypeScript code
-  (same files)            protoc-gen-es          (types + schemas)
-                          protoc-gen-protonats-ts (clients, handlers, subjects)
-                                │
-                                ▼
-                         TS runtime library
-                         (@protonats/runtime)
-                                │
-                                ▼
-                          nats.js client
+                        protoc
+.proto  ────────────────────────────────────→  Go: types + clients/handlers
+(messages, services,    protoc-gen-go              ↓
+ protonats options)     protoc-gen-protonats    protonats runtime → nats.go
+                        protoc-gen-es              ↓
+                        protoc-gen-protonats-ts TS: types + clients/handlers
+                                                   ↓
+                                                @protonats/runtime → nats.js
 ```
 
-Both Go and TypeScript sides use binary protobuf over NATS with identical subjects and error headers (`Nats-Service-Error` / `Nats-Service-Error-Code`), so a Go handler can serve a TypeScript client and vice versa.
+Both sides speak binary protobuf on identical subjects with identical error
+headers, so a Go handler can serve a TypeScript client and vice versa.
 
-1. **`protonats/options.proto`** - Proto file defining custom options (service, method, field, message level)
-2. **`protoc-gen-protonats`** - Protoc plugin that generates Go code
-3. **`protonats` Go package** - Go runtime library providing connection management, middleware, and helpers
-4. **`protoc-gen-protonats-ts`** - Protoc plugin that generates TypeScript code
-5. **`@protonats/runtime`** - TypeScript runtime library wrapping nats.js with protobuf serialization
+## Scope
 
-## Supported Communication Patterns
+Generated in full: request/reply, publish, JetStream publish, JetStream
+consume (Go only for the JetStream pair).
 
-### Tier 1: Full code generation
+Deliberately not generated, because they are too varied or too operational to
+benefit from codegen — use `pn.NatsConn()` or `pn.JetStream()` instead:
 
-These patterns get full code generation with type-safe clients and handlers.
+- **Request-many (scatter-gather)** — many tuning knobs, better as a call-site helper.
+- **Object store** — streaming large blobs gains nothing from protobuf typing.
+- **Stream topologies** — mirrors, sources, subject transforms are infrastructure.
+- **Batch publishing** — application-specific.
 
-| Pattern | How it's expressed | Description |
-|---------|-------------------|-------------|
-| **Request/Response** | `rpc Foo(Req) returns (Resp)` | Unary. Client sends request, gets one response. Maps to NATS Request/Reply. |
-| **Publish (fire-and-forget)** | `rpc Foo(Msg) returns (google.protobuf.Empty)` + `type: PUBLISH` | Client publishes, no response. Maps to NATS Publish. |
-| **JetStream Publish** | `rpc Foo(Msg) returns (google.protobuf.Empty)` + `type: JETSTREAM_PUBLISH` | Publish to stream with ack. Maps to JetStream Publish. |
-| **JetStream Consume** | `rpc Foo(Msg) returns (google.protobuf.Empty)` + `type: JETSTREAM_CONSUME` | Consume from stream. Handler-only. Maps to JetStream Consumer. |
+Reserved in `options.proto` but not implemented; the plugin fails if set:
+**`micro`** service discovery and **`kv`** typed store helpers.
 
-### Tier 2: Typed helpers
+## Two Rules Worth Knowing
 
-These get generated type-safe serialization wrappers around existing NATS APIs.
+**Queue group names must be unique per method.** NATS groups queue subscribers
+by queue name across every subject pattern that matches the delivered subject,
+not per subscription subject. A shared name would let a handler on `orders.*`
+swallow messages meant for one on `orders.Create`. Naming the group after the
+proto method gives load-balancing within a method and isolation between them.
 
-| Pattern | How it's expressed | Description |
-|---------|-------------------|-------------|
-| **KV Store** | `kv` message option | Type-safe get/put/delete/watch for a protobuf message in a NATS KV bucket. |
-
-### Tier 3: Use NATS directly
-
-These patterns are too varied or operational to warrant code generation. ProtoNats provides the serialized message types; you use `*nats.Conn` or `jetstream.JetStream` directly.
-
-| Pattern | Why not generated |
-|---------|------------------|
-| **Request-Many (scatter-gather)** | Niche pattern with many tuning knobs (timeouts, stall timers, max responses). Better served by a runtime helper function than code generation. |
-| **Object Store** | Streaming large binary blobs doesn't benefit from protobuf typing. |
-| **Complex stream topologies** | Mirrors, sources, subject transforms -- infrastructure config, not service definitions. |
-| **Batch publishing** | Highly application-specific batching logic. |
-
-## Subject Naming
-
-ProtoNats derives NATS subjects from the proto package and method name by default:
-
-```
-{package}.{MethodName}
-```
-
-For example, given:
-```protobuf
-package myapp.orders;
-service OrderService {
-  rpc GetOrder(GetOrderRequest) returns (Order);
-}
-```
-
-The default subject is: `myapp.orders.GetOrder`
-
-The service name is intentionally **not** included by default. The proto package already provides namespacing, and including the service name produces unnecessarily long subjects. If a package contains multiple services and there's a name collision, override with `subject_prefix`.
-
-This default can be overridden at every level (service prefix, method subject) via custom options. Dynamic subject components (like entity IDs) are supported via template syntax.
-
-## Error Handling
-
-ProtoNats follows the NATS Service API convention (`Nats-Service-Error` / `Nats-Service-Error-Code` headers). This means:
-
-- Any NATS tooling that understands the Service API can interpret ProtoNats errors.
-- The generated Go client checks these headers and returns structured `*protonats.Error` values.
-- The generated TS client checks these headers and throws `ProtoNatsError` instances.
-- Go handlers return errors via `protonats.Errorf(code, format, args...)`.
-- TS handlers throw `new ProtoNatsError(code, message)`.
-- For JetStream: standard ack semantics (Ack/Nak/Term) apply.
-
-## Middleware / Interceptors
-
-Both clients and handlers support middleware chains (similar to gRPC interceptors):
-
-- **Client interceptors**: Run before sending / after receiving. Use for logging, tracing, retry.
-- **Handler interceptors**: Run before / after the handler function. Use for auth, logging, metrics, panic recovery.
-
-Interceptors have access to the NATS message metadata (subject, headers, reply subject) in addition to the typed proto message.
+**Subjects must not overlap.** For the same matching reason, two handlers whose
+subjects can both match one message will both receive it, and a caller would
+take whichever reply came first. Code generation rejects this rather than
+letting it become a heisenbug in production.

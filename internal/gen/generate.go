@@ -5,15 +5,22 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/compiler/protogen"
-	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
+
+	protonats "github.com/mudomi/protonats"
 )
 
-const runtimePackage = "github.com/mudomi/protonats"
+const (
+	runtimePackage   = "github.com/mudomi/protonats"
+	jetstreamPackage = "github.com/nats-io/nats.go/jetstream"
+)
 
 // GenerateFile produces a _protonats.pb.go file for each proto file with services.
-func GenerateFile(plugin *protogen.Plugin, file *protogen.File) {
+func GenerateFile(plugin *protogen.Plugin, file *protogen.File) error {
 	if len(file.Services) == 0 {
-		return
+		return nil
+	}
+	if err := ValidateFile(file); err != nil {
+		return err
 	}
 
 	g := plugin.NewGeneratedFile(
@@ -28,39 +35,13 @@ func GenerateFile(plugin *protogen.Plugin, file *protogen.File) {
 	g.P()
 
 	for _, svc := range file.Services {
-		prefix := resolveSubjectPrefix(file, svc)
+		prefix := SubjectPrefix(file, svc)
 		generateClient(g, svc, prefix)
 		generateHandlerInterface(g, svc)
 		generateUnimplemented(g, svc)
 		generateRegister(g, svc, prefix)
 	}
-}
-
-func resolveSubjectPrefix(file *protogen.File, svc *protogen.Service) string {
-	if raw, ok := svc.Desc.Options().(*descriptorpb.ServiceOptions); ok {
-		if opts := GetServiceOptions(raw); opts != nil && opts.SubjectPrefix != "" {
-			return opts.SubjectPrefix
-		}
-	}
-	return string(file.Desc.Package())
-}
-
-func methodType(m *protogen.Method) MethodType {
-	if raw, ok := m.Desc.Options().(*descriptorpb.MethodOptions); ok {
-		if opts := GetMethodOptions(raw); opts != nil {
-			return opts.Type
-		}
-	}
-	return MethodTypeRequestReply
-}
-
-func methodSubject(prefix string, m *protogen.Method) string {
-	if raw, ok := m.Desc.Options().(*descriptorpb.MethodOptions); ok {
-		if opts := GetMethodOptions(raw); opts != nil && opts.Subject != "" {
-			return opts.Subject
-		}
-	}
-	return prefix + "." + string(m.Desc.Name())
+	return nil
 }
 
 // ── Identifiers ──
@@ -74,22 +55,28 @@ func ctxType(g *protogen.GeneratedFile) string              { return ident(g, "c
 func protoMsg(g *protogen.GeneratedFile) string {
 	return ident(g, "google.golang.org/protobuf/proto", "Message")
 }
-func natsMsg(g *protogen.GeneratedFile) string { return ident(g, "github.com/nats-io/nats.go", "Msg") }
 
-// ── Subject resolution code generation ──
+// methodName returns the fully qualified proto method name passed to
+// interceptors, e.g. "myapp.orders.OrderService.GetOrder".
+func methodName(m *protogen.Method) string {
+	return string(m.Desc.FullName())
+}
 
-func genSubjectVar(g *protogen.GeneratedFile, subject string, tokens []string) {
-	if len(tokens) > 0 {
-		format := templatePattern.ReplaceAllString(subject, "%v")
-		args := make([]string, len(tokens))
-		for i, t := range tokens {
-			args[i] = "req." + snakeToCamel(t)
-		}
-		fmtSprintf := ident(g, "fmt", "Sprintf")
-		g.P("    subject := ", fmtSprintf, "(", fmt.Sprintf("%q", format), ", ", strings.Join(args, ", "), ")")
-	} else {
-		g.P("    subject := ", fmt.Sprintf("%q", subject))
+// subjectExpr returns the Go expression producing the subject for a client
+// call: a string literal, or an fmt.Sprintf over the token fields.
+func subjectExpr(g *protogen.GeneratedFile, m *protogen.Method, subject string) string {
+	tokens, err := TokenFields(m, subject)
+	if err != nil || len(tokens) == 0 {
+		// ValidateFile already rejected files with bad tokens.
+		return fmt.Sprintf("%q", subject)
 	}
+
+	format := templatePattern.ReplaceAllString(subject, "%v")
+	args := make([]string, len(tokens))
+	for i, f := range tokens {
+		args[i] = "req.Get" + f.GoName + "()"
+	}
+	return fmt.Sprintf("%s(%q, %s)", ident(g, "fmt", "Sprintf"), format, strings.Join(args, ", "))
 }
 
 // ── Client ──
@@ -98,6 +85,7 @@ func generateClient(g *protogen.GeneratedFile, svc *protogen.Service, prefix str
 	name := svc.GoName
 	conn := pnIdent(g, "Conn")
 	callOpt := pnIdent(g, "CallOption")
+	withMethod := pnIdent(g, "WithMethodName")
 
 	g.P("type ", name, "Client struct {")
 	g.P("    pn *", conn)
@@ -109,32 +97,45 @@ func generateClient(g *protogen.GeneratedFile, svc *protogen.Service, prefix str
 	g.P()
 
 	for _, m := range svc.Methods {
-		mt := methodType(m)
-		subject := methodSubject(prefix, m)
-		tokens := subjectTemplateTokens(subject)
+		subject := MethodSubject(prefix, m)
 		in := g.QualifiedGoIdent(m.Input.GoIdent)
+		subjExpr := subjectExpr(g, m, subject)
 
-		switch mt {
-		case MethodTypeRequestReply:
+		switch MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
 			out := g.QualifiedGoIdent(m.Output.GoIdent)
 			g.P("func (c *", name, "Client) ", m.GoName, "(ctx ", ctxType(g), ", req *", in, ", opts ...", callOpt, ") (*", out, ", error) {")
-			genSubjectVar(g, subject, tokens)
+			// Full slice expression: appending to the caller's slice in place would
+			// write into their backing array when it has spare capacity.
+			g.P("    opts = append(opts[:len(opts):len(opts)], ", withMethod, "(", fmt.Sprintf("%q", methodName(m)), "))")
 			g.P("    resp := new(", out, ")")
-			g.P("    if err := c.pn.Request(ctx, subject, req, resp, opts...); err != nil {")
+			g.P("    if err := c.pn.Request(ctx, ", subjExpr, ", req, resp, opts...); err != nil {")
 			g.P("        return nil, err")
 			g.P("    }")
 			g.P("    return resp, nil")
 			g.P("}")
 			g.P()
 
-		case MethodTypePublish, MethodTypeJetstreamPublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("func (c *", name, "Client) ", m.GoName, "(ctx ", ctxType(g), ", req *", in, ", opts ...", callOpt, ") error {")
-			genSubjectVar(g, subject, tokens)
-			g.P("    return c.pn.Publish(ctx, subject, req, opts...)")
+			// Full slice expression: appending to the caller's slice in place would
+			// write into their backing array when it has spare capacity.
+			g.P("    opts = append(opts[:len(opts):len(opts)], ", withMethod, "(", fmt.Sprintf("%q", methodName(m)), "))")
+			g.P("    return c.pn.Publish(ctx, ", subjExpr, ", req, opts...)")
 			g.P("}")
 			g.P()
 
-		case MethodTypeJetstreamConsume:
+		case protonats.MethodType_JETSTREAM_PUBLISH:
+			pubAck := ident(g, jetstreamPackage, "PubAck")
+			g.P("func (c *", name, "Client) ", m.GoName, "(ctx ", ctxType(g), ", req *", in, ", opts ...", callOpt, ") (*", pubAck, ", error) {")
+			// Full slice expression: appending to the caller's slice in place would
+			// write into their backing array when it has spare capacity.
+			g.P("    opts = append(opts[:len(opts):len(opts)], ", withMethod, "(", fmt.Sprintf("%q", methodName(m)), "))")
+			g.P("    return c.pn.PublishJetStream(ctx, ", subjExpr, ", req, opts...)")
+			g.P("}")
+			g.P()
+
+		case protonats.MethodType_JETSTREAM_CONSUME:
 			// No client for consumers.
 		}
 	}
@@ -147,15 +148,14 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc *protogen.Service) 
 	g.P("type ", svc.GoName, "Handler interface {")
 	for _, m := range svc.Methods {
 		in := g.QualifiedGoIdent(m.Input.GoIdent)
-		switch methodType(m) {
-		case MethodTypeRequestReply:
+		switch MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
 			out := g.QualifiedGoIdent(m.Output.GoIdent)
 			g.P("    ", m.GoName, "(ctx ", ctx, ", req *", in, ") (*", out, ", error)")
-		case MethodTypePublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("    ", m.GoName, "(ctx ", ctx, ", req *", in, ") error")
-		case MethodTypeJetstreamConsume:
-			acker := pnIdent(g, "Acker")
-			g.P("    ", m.GoName, "(ctx ", ctx, ", req *", in, ", ack ", acker, ") error")
+		case protonats.MethodType_JETSTREAM_CONSUME:
+			g.P("    ", m.GoName, "(ctx ", ctx, ", req *", in, ", ack ", pnIdent(g, "Acker"), ") error")
 		}
 	}
 	g.P("}")
@@ -174,19 +174,18 @@ func generateUnimplemented(g *protogen.GeneratedFile, svc *protogen.Service) {
 
 	for _, m := range svc.Methods {
 		in := g.QualifiedGoIdent(m.Input.GoIdent)
-		switch methodType(m) {
-		case MethodTypeRequestReply:
+		switch MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
 			out := g.QualifiedGoIdent(m.Output.GoIdent)
 			g.P("func (", uname, ") ", m.GoName, "(_ ", ctx, ", _ *", in, ") (*", out, ", error) {")
 			g.P("    return nil, ", errorf, "(501, \"not implemented\")")
 			g.P("}")
-		case MethodTypePublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("func (", uname, ") ", m.GoName, "(_ ", ctx, ", _ *", in, ") error {")
 			g.P("    return ", errorf, "(501, \"not implemented\")")
 			g.P("}")
-		case MethodTypeJetstreamConsume:
-			acker := pnIdent(g, "Acker")
-			g.P("func (", uname, ") ", m.GoName, "(_ ", ctx, ", _ *", in, ", _ ", acker, ") error {")
+		case protonats.MethodType_JETSTREAM_CONSUME:
+			g.P("func (", uname, ") ", m.GoName, "(_ ", ctx, ", _ *", in, ", _ ", pnIdent(g, "Acker"), ") error {")
 			g.P("    return ", errorf, "(501, \"not implemented\")")
 			g.P("}")
 		}
@@ -203,7 +202,6 @@ func generateRegister(g *protogen.GeneratedFile, svc *protogen.Service, prefix s
 	handlerOpt := pnIdent(g, "HandlerOption")
 	applyOpts := pnIdent(g, "ApplyHandlerOptions")
 	pm := protoMsg(g)
-	nm := natsMsg(g)
 	ctx := ctxType(g)
 
 	g.P("func Register", name, "Handler(pn *", conn, ", handler ", name, "Handler, opts ...", handlerOpt, ") (*", reg, ", error) {")
@@ -211,45 +209,75 @@ func generateRegister(g *protogen.GeneratedFile, svc *protogen.Service, prefix s
 	g.P("    reg := &", reg, "{}")
 	g.P()
 
-	hasSubscriptions := false
+	registered := false
 	for _, m := range svc.Methods {
-		mt := methodType(m)
-		subject := methodSubject(prefix, m)
-		subSubject := subscribeSubject(subject)
+		subject := MethodSubject(prefix, m)
+		subSubject := SubscribeSubject(subject)
 		in := g.QualifiedGoIdent(m.Input.GoIdent)
 
-		switch mt {
-		case MethodTypeRequestReply:
-			hasSubscriptions = true
+		switch MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
+			registered = true
 			g.P("    {")
-			g.P("        sub, err := pn.Subscribe(", fmt.Sprintf("%q", subSubject), ", ho.QueueGroup,")
+			g.P("        sub, err := pn.Subscribe(", fmt.Sprintf("%q, %q", methodName(m), subSubject), ", ho,")
 			g.P("            func() ", pm, " { return new(", in, ") },")
-			g.P("            func(ctx ", ctx, ", m *", nm, ", req ", pm, ") (", pm, ", error) {")
+			g.P("            func(ctx ", ctx, ", req ", pm, ") (", pm, ", error) {")
 			g.P("                return handler.", m.GoName, "(ctx, req.(*", in, "))")
 			g.P("            },")
 			g.P("        )")
-			g.P("        if err != nil { return nil, err }")
+			g.P("        if err != nil {")
+			g.P("            _ = reg.Unsubscribe()")
+			g.P("            return nil, err")
+			g.P("        }")
 			g.P("        reg.AddSubscription(sub)")
 			g.P("    }")
 			g.P()
 
-		case MethodTypePublish:
-			hasSubscriptions = true
+		case protonats.MethodType_PUBLISH:
+			registered = true
 			g.P("    {")
-			g.P("        sub, err := pn.SubscribePublish(", fmt.Sprintf("%q", subSubject), ", ho.QueueGroup,")
+			g.P("        sub, err := pn.SubscribePublish(", fmt.Sprintf("%q, %q", methodName(m), subSubject), ", ho,")
 			g.P("            func() ", pm, " { return new(", in, ") },")
 			g.P("            func(ctx ", ctx, ", req ", pm, ") error {")
 			g.P("                return handler.", m.GoName, "(ctx, req.(*", in, "))")
 			g.P("            },")
 			g.P("        )")
-			g.P("        if err != nil { return nil, err }")
+			g.P("        if err != nil {")
+			g.P("            _ = reg.Unsubscribe()")
+			g.P("            return nil, err")
+			g.P("        }")
 			g.P("        reg.AddSubscription(sub)")
+			g.P("    }")
+			g.P()
+
+		case protonats.MethodType_JETSTREAM_CONSUME:
+			registered = true
+			stream, consumer := MethodStream(m)
+			consumeCfg := pnIdent(g, "ConsumeConfig")
+			acker := pnIdent(g, "Acker")
+			g.P("    {")
+			g.P("        cc, err := pn.ConsumeJetStream(", consumeCfg, "{")
+			g.P("            Method:   ", fmt.Sprintf("%q", methodName(m)), ",")
+			g.P("            Subject:  ", fmt.Sprintf("%q", subSubject), ",")
+			g.P("            Stream:   ", fmt.Sprintf("%q", stream), ",")
+			g.P("            Consumer: ", fmt.Sprintf("%q", consumer), ",")
+			g.P("        }, ho,")
+			g.P("            func() ", pm, " { return new(", in, ") },")
+			g.P("            func(ctx ", ctx, ", req ", pm, ", ack ", acker, ") error {")
+			g.P("                return handler.", m.GoName, "(ctx, req.(*", in, "), ack)")
+			g.P("            },")
+			g.P("        )")
+			g.P("        if err != nil {")
+			g.P("            _ = reg.Unsubscribe()")
+			g.P("            return nil, err")
+			g.P("        }")
+			g.P("        reg.AddConsumeContext(cc)")
 			g.P("    }")
 			g.P()
 		}
 	}
 
-	if !hasSubscriptions {
+	if !registered {
 		g.P("    _ = ho")
 	}
 

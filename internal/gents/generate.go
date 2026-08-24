@@ -6,15 +6,18 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/compiler/protogen"
-	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 
+	protonats "github.com/mudomi/protonats"
 	"github.com/mudomi/protonats/internal/gen"
 )
 
 // GenerateFile produces a _protonats.ts file for each proto file with services.
-func GenerateFile(plugin *protogen.Plugin, file *protogen.File) {
+func GenerateFile(plugin *protogen.Plugin, file *protogen.File) error {
 	if len(file.Services) == 0 {
-		return
+		return nil
+	}
+	if err := gen.ValidateFile(file); err != nil {
+		return err
 	}
 
 	filename := file.GeneratedFilenamePrefix + "_protonats.ts"
@@ -43,62 +46,43 @@ func GenerateFile(plugin *protogen.Plugin, file *protogen.File) {
 	}
 
 	for _, svc := range file.Services {
-		prefix := resolveSubjectPrefix(file, svc)
+		prefix := gen.SubjectPrefix(file, svc)
 		generateClient(g, svc, prefix)
 		generateHandlerInterface(g, svc)
 		generateRegister(g, svc, prefix)
 	}
+	return nil
 }
 
 func collectImports(file *protogen.File) (types []string, schemas []string) {
 	seen := map[string]bool{}
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			types = append(types, name)
+			schemas = append(schemas, name+"Schema")
+		}
+	}
+
 	for _, svc := range file.Services {
 		for _, m := range svc.Methods {
-			inName := string(m.Input.Desc.Name())
-			outName := string(m.Output.Desc.Name())
-			mt := methodType(m)
-
-			if !seen[inName] {
-				seen[inName] = true
-				types = append(types, inName)
-				schemas = append(schemas, inName+"Schema")
-			}
-
-			if mt == gen.MethodTypeRequestReply && !seen[outName] {
-				seen[outName] = true
-				types = append(types, outName)
-				schemas = append(schemas, outName+"Schema")
+			switch gen.MethodTypeOf(m) {
+			case protonats.MethodType_REQUEST_REPLY:
+				add(string(m.Input.Desc.Name()))
+				add(string(m.Output.Desc.Name()))
+			case protonats.MethodType_PUBLISH:
+				add(string(m.Input.Desc.Name()))
 			}
 		}
 	}
 	return
 }
 
-func resolveSubjectPrefix(file *protogen.File, svc *protogen.Service) string {
-	if raw, ok := svc.Desc.Options().(*descriptorpb.ServiceOptions); ok {
-		if opts := gen.GetServiceOptions(raw); opts != nil && opts.SubjectPrefix != "" {
-			return opts.SubjectPrefix
-		}
-	}
-	return string(file.Desc.Package())
-}
-
-func methodType(m *protogen.Method) gen.MethodType {
-	if raw, ok := m.Desc.Options().(*descriptorpb.MethodOptions); ok {
-		if opts := gen.GetMethodOptions(raw); opts != nil {
-			return opts.Type
-		}
-	}
-	return gen.MethodTypeRequestReply
-}
-
-func methodSubject(prefix string, m *protogen.Method) string {
-	if raw, ok := m.Desc.Options().(*descriptorpb.MethodOptions); ok {
-		if opts := gen.GetMethodOptions(raw); opts != nil && opts.Subject != "" {
-			return opts.Subject
-		}
-	}
-	return prefix + "." + string(m.Desc.Name())
+// jetStreamNotice explains why a method is absent from the generated TS code.
+func jetStreamNotice(g *protogen.GeneratedFile, m *protogen.Method) {
+	g.P("  // ", m.GoName, " (", gen.MethodTypeOf(m), ") is not generated: the TS runtime")
+	g.P("  // does not support JetStream; use the nats.js JetStream API directly.")
+	g.P()
 }
 
 // ── Client ──
@@ -111,29 +95,31 @@ func generateClient(g *protogen.GeneratedFile, svc *protogen.Service, prefix str
 	g.P()
 
 	for _, m := range svc.Methods {
-		mt := methodType(m)
-		subject := methodSubject(prefix, m)
-		tokens := subjectTemplateTokens(subject)
+		subject := gen.MethodSubject(prefix, m)
+		tokens, _ := gen.TokenFields(m, subject) // validated in GenerateFile
 		inName := string(m.Input.Desc.Name())
 		tsMethod := pascalToCamel(m.GoName)
 		subjectExpr := subjectTemplateLiteral(subject, tokens)
 
-		switch mt {
-		case gen.MethodTypeRequestReply:
+		switch gen.MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
 			outName := string(m.Output.Desc.Name())
 			g.P("  async ", tsMethod, "(req: ", inName, ", opts?: CallOptions): Promise<", outName, "> {")
 			g.P("    return this.pn.request(", subjectExpr, ", req, ", inName, "Schema, ", outName, "Schema, opts);")
 			g.P("  }")
 			g.P()
 
-		case gen.MethodTypePublish, gen.MethodTypeJetstreamPublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("  ", tsMethod, "(req: ", inName, ", opts?: CallOptions): void {")
 			g.P("    this.pn.publish(", subjectExpr, ", req, ", inName, "Schema, opts);")
 			g.P("  }")
 			g.P()
 
-		case gen.MethodTypeJetstreamConsume:
-			// No client method for consumers.
+		case protonats.MethodType_JETSTREAM_PUBLISH:
+			jetStreamNotice(g, m)
+
+		case protonats.MethodType_JETSTREAM_CONSUME:
+			// No client for consumers.
 		}
 	}
 
@@ -151,14 +137,14 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc *protogen.Service) 
 		inName := string(m.Input.Desc.Name())
 		tsMethod := pascalToCamel(m.GoName)
 
-		switch methodType(m) {
-		case gen.MethodTypeRequestReply:
+		switch gen.MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
 			outName := string(m.Output.Desc.Name())
 			g.P("  ", tsMethod, "(ctx: HandlerContext, req: ", inName, "): Promise<", outName, ">;")
-		case gen.MethodTypePublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("  ", tsMethod, "(ctx: HandlerContext, req: ", inName, "): Promise<void>;")
-		case gen.MethodTypeJetstreamConsume:
-			g.P("  ", tsMethod, "(ctx: HandlerContext, req: ", inName, "): Promise<void>;")
+		case protonats.MethodType_JETSTREAM_CONSUME:
+			jetStreamNotice(g, m)
 		}
 	}
 	g.P("}")
@@ -179,17 +165,17 @@ func generateRegister(g *protogen.GeneratedFile, svc *protogen.Service, prefix s
 	g.P()
 
 	for _, m := range svc.Methods {
-		mt := methodType(m)
-		subject := methodSubject(prefix, m)
-		subSubject := subscribeSubject(subject)
+		subject := gen.MethodSubject(prefix, m)
+		subSubject := gen.SubscribeSubject(subject)
 		inName := string(m.Input.Desc.Name())
 		tsMethod := pascalToCamel(m.GoName)
-		outName := string(m.Output.Desc.Name())
 
-		switch mt {
-		case gen.MethodTypeRequestReply:
+		switch gen.MethodTypeOf(m) {
+		case protonats.MethodType_REQUEST_REPLY:
+			outName := string(m.Output.Desc.Name())
 			g.P("  reg.addSubscription(")
 			g.P("    pn.subscribe(")
+			g.P(fmt.Sprintf("      %q,", string(m.Desc.FullName())))
 			g.P(fmt.Sprintf("      %q,", subSubject))
 			g.P("      opts?.queueGroup,")
 			g.P("      ", inName, "Schema,")
@@ -201,9 +187,10 @@ func generateRegister(g *protogen.GeneratedFile, svc *protogen.Service, prefix s
 			g.P("  );")
 			g.P()
 
-		case gen.MethodTypePublish:
+		case protonats.MethodType_PUBLISH:
 			g.P("  reg.addSubscription(")
 			g.P("    pn.subscribePublish(")
+			g.P(fmt.Sprintf("      %q,", string(m.Desc.FullName())))
 			g.P(fmt.Sprintf("      %q,", subSubject))
 			g.P("      opts?.queueGroup,")
 			g.P("      ", inName, "Schema,")

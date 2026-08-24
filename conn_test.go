@@ -2,7 +2,10 @@ package protonats
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,16 +14,49 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/mudomi/protonats/internal/natstest"
 )
 
 func connectNats(t *testing.T) *nats.Conn {
 	t.Helper()
-	nc, err := nats.Connect(nats.DefaultURL, nats.Timeout(2*time.Second))
-	if err != nil {
-		t.Skipf("NATS not available at %s: %v", nats.DefaultURL, err)
+	return natstest.Connect(t)
+}
+
+// testLogger captures log output for assertions.
+type testLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *testLogger) Printf(format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *testLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
 	}
-	t.Cleanup(func() { nc.Close() })
-	return nc
+	return false
+}
+
+func echoHandler(ctx context.Context, req proto.Message) (proto.Message, error) {
+	return wrapperspb.String(req.(*wrapperspb.StringValue).Value + " back"), nil
+}
+
+func newStringValue() proto.Message { return &wrapperspb.StringValue{} }
+
+func subscribeEcho(t *testing.T, pn *Conn, subject string, opts ...HandlerOption) {
+	t.Helper()
+	sub, err := pn.Subscribe("test.Method", subject, ApplyHandlerOptions(opts), newStringValue, echoHandler)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
 }
 
 func TestNew_NilConn(t *testing.T) {
@@ -28,42 +64,35 @@ func TestNew_NilConn(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestNew_WithOptions(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc, WithCodec(JSONCodec), WithDefaultTimeout(10*time.Second))
+func TestNew_Defaults(t *testing.T) {
+	pn, err := New(connectNats(t))
 	require.NoError(t, err)
-	assert.Equal(t, "application/json", pn.Codec().ContentType())
-	assert.Equal(t, nc, pn.NatsConn())
+	assert.Equal(t, ProtoCodec{}, pn.Codec())
+	assert.Equal(t, defaultTimeout, pn.defaultTimeout)
+}
+
+func TestNew_Options(t *testing.T) {
+	pn, err := New(connectNats(t), WithDefaultTimeout(time.Second), WithCodec(JSONCodec))
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, pn.defaultTimeout)
+	assert.Equal(t, JSONCodec, pn.Codec())
 }
 
 func TestRequestReply(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	sub, err := pn.Subscribe("test.echo", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return wrapperspb.String(req.(*wrapperspb.StringValue).Value + " reply"), nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.echo")
 
 	resp := &wrapperspb.StringValue{}
 	require.NoError(t, pn.Request(context.Background(), "test.echo", wrapperspb.String("hello"), resp))
-	assert.Equal(t, "hello reply", resp.Value)
+	assert.Equal(t, "hello back", resp.Value)
 }
 
 func TestRequestReply_HandlerError(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	sub, err := pn.Subscribe("test.err", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return nil, Errorf(404, "not found")
-	})
+	pn, _ := New(connectNats(t))
+	sub, err := pn.Subscribe("test.Method", "test.err", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			return nil, Errorf(404, "nope")
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -71,18 +100,32 @@ func TestRequestReply_HandlerError(t *testing.T) {
 	var pnErr *Error
 	require.ErrorAs(t, err, &pnErr)
 	assert.Equal(t, 404, pnErr.Code)
+	assert.Equal(t, "nope", pnErr.Message)
+}
+
+func TestRequestReply_PlainErrorBecomes500(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	sub, err := pn.Subscribe("test.Method", "test.plainerr", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			return nil, fmt.Errorf("plain failure")
+		})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	err = pn.Request(context.Background(), "test.plainerr", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	var pnErr *Error
+	require.ErrorAs(t, err, &pnErr)
+	assert.Equal(t, 500, pnErr.Code)
+	assert.Equal(t, "plain failure", pnErr.Message)
 }
 
 func TestRequestReply_HandlerPanic(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	sub, err := pn.Subscribe("test.panic", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		panic("boom")
-	})
+	logger := &testLogger{}
+	pn, _ := New(connectNats(t), WithLogger(logger))
+	sub, err := pn.Subscribe("test.Method", "test.panic", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			panic("kaboom")
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -90,491 +133,616 @@ func TestRequestReply_HandlerPanic(t *testing.T) {
 	var pnErr *Error
 	require.ErrorAs(t, err, &pnErr)
 	assert.Equal(t, 500, pnErr.Code)
+	assert.True(t, logger.contains("panic"))
 }
 
-func TestPublish(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	var received string
-	var mu sync.Mutex
-	done := make(chan struct{})
-
-	sub, err := pn.SubscribePublish("test.fire", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, req proto.Message) error {
-		mu.Lock()
-		received = req.(*wrapperspb.StringValue).Value
-		mu.Unlock()
-		close(done)
-		return nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	require.NoError(t, pn.Publish(context.Background(), "test.fire", wrapperspb.String("fire")))
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
-	}
-
-	mu.Lock()
-	assert.Equal(t, "fire", received)
-	mu.Unlock()
-}
-
-func TestRequestReply_Timeout(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	err = pn.Request(context.Background(), "test.nobody", wrapperspb.String("x"), &wrapperspb.StringValue{},
-		WithTimeout(100*time.Millisecond))
-	require.Error(t, err)
-}
-
-func TestRequestReply_SubjectOverride(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	sub, err := pn.Subscribe("real.subject", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return wrapperspb.String("ok"), nil
-	})
+// The end-to-end half of TestErrorFromHeaders_EmptyMessageIsStillAnError: a
+// handler failure with no message must not reach the caller as a success.
+func TestRequestReply_HandlerErrorWithEmptyMessage(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	sub, err := pn.Subscribe("test.Method", "test.emptyerr", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			return nil, Errorf(404, "")
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
 	resp := &wrapperspb.StringValue{}
-	require.NoError(t, pn.Request(context.Background(), "wrong", wrapperspb.String("x"), resp,
-		WithSubject("real.subject")))
-	assert.Equal(t, "ok", resp.Value)
+	err = pn.Request(context.Background(), "test.emptyerr", wrapperspb.String("x"), resp)
+	var pnErr *Error
+	require.ErrorAs(t, err, &pnErr)
+	assert.Equal(t, 404, pnErr.Code)
 }
 
-func TestQueueGroup(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
+func TestRequest_Timeout(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	sub, err := pn.Subscribe("test.Method", "test.slow", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			time.Sleep(2 * time.Second)
+			return req, nil
+		})
 	require.NoError(t, err)
+	defer sub.Unsubscribe()
 
-	var count int
-	var mu sync.Mutex
+	err = pn.Request(context.Background(), "test.slow", wrapperspb.String("x"), &wrapperspb.StringValue{}, WithTimeout(100*time.Millisecond))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
 
-	handler := func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		mu.Lock()
-		count++
-		mu.Unlock()
-		return wrapperspb.String("ok"), nil
+// ── Timeout resolution ──
+
+// A caller's own deadline wins over the connection default, in both
+// directions: it is neither ignored nor clipped to the default.
+func TestRequest_CallerDeadlineOverridesDefault(t *testing.T) {
+	pn, _ := New(connectNats(t), WithDefaultTimeout(50*time.Millisecond))
+	sub, err := pn.Subscribe("test.Method", "test.slowdefault", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			time.Sleep(300 * time.Millisecond)
+			return req, nil
+		})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(ctx, "test.slowdefault", wrapperspb.String("x"), resp),
+		"a 3s caller deadline must not be clipped to the 50ms connection default")
+	assert.Equal(t, "x", resp.Value)
+}
+
+// WithTimeout narrows an existing deadline; it can never extend past it,
+// because a child context cannot outlive its parent.
+func TestWithTimeout_NarrowsButNeverExtends(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	parent, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	parentDeadline, _ := parent.Deadline()
+
+	extended, cancelExtended := pn.withTimeout(parent, applyCallOptions([]CallOption{WithTimeout(time.Hour)}))
+	defer cancelExtended()
+	got, ok := extended.Deadline()
+	require.True(t, ok)
+	assert.Equal(t, parentDeadline, got, "an hour-long call timeout cannot outlive a 100ms parent")
+
+	narrowed, cancelNarrowed := pn.withTimeout(parent, applyCallOptions([]CallOption{WithTimeout(10 * time.Millisecond)}))
+	defer cancelNarrowed()
+	got, ok = narrowed.Deadline()
+	require.True(t, ok)
+	assert.True(t, got.Before(parentDeadline), "a shorter call timeout must win")
+}
+
+func TestRequest_CancelledContext(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.reqcancelled")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := pn.Request(ctx, "test.reqcancelled", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRequest_NoResponders(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	err := pn.Request(context.Background(), "test.nobody.home", wrapperspb.String("x"), &wrapperspb.StringValue{}, WithTimeout(time.Second))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, nats.ErrNoResponders)
+}
+
+func TestRequest_SubjectOverride(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.actual")
+
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(context.Background(), "test.ignored", wrapperspb.String("x"), resp, WithSubject("test.actual")))
+	assert.Equal(t, "x back", resp.Value)
+}
+
+func TestRequest_WithHeaders(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	var gotHeader string
+	sub, err := pn.Subscribe("test.Method", "test.headers", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			gotHeader = MsgFromContext(ctx).Header.Get("X-Test")
+			return req, nil
+		})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	h := nats.Header{}
+	h.Set("X-Test", "v1")
+	require.NoError(t, pn.Request(context.Background(), "test.headers", wrapperspb.String("x"), &wrapperspb.StringValue{}, WithHeaders(h)))
+	assert.Equal(t, "v1", gotHeader)
+}
+
+func TestRequest_EmptyMessageRoundtrip(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.empty")
+
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(context.Background(), "test.empty", wrapperspb.String(""), resp))
+	assert.Equal(t, " back", resp.Value)
+}
+
+func TestRequest_Concurrent(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.concurrent")
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := &wrapperspb.StringValue{}
+			if err := pn.Request(context.Background(), "test.concurrent", wrapperspb.String(fmt.Sprint(i)), resp); err != nil {
+				errs <- err
+			}
+		}(i)
 	}
-
-	sub1, _ := pn.Subscribe("test.q", "w", func() proto.Message { return &wrapperspb.StringValue{} }, handler)
-	sub2, _ := pn.Subscribe("test.q", "w", func() proto.Message { return &wrapperspb.StringValue{} }, handler)
-	defer sub1.Unsubscribe()
-	defer sub2.Unsubscribe()
-
-	require.NoError(t, pn.Request(context.Background(), "test.q", wrapperspb.String("x"), &wrapperspb.StringValue{}))
-	time.Sleep(50 * time.Millisecond)
-
-	mu.Lock()
-	assert.Equal(t, 1, count)
-	mu.Unlock()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 }
 
-func TestContextValues(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
+func TestRequest_JSONCodec(t *testing.T) {
+	pn, _ := New(connectNats(t), WithCodec(JSONCodec))
+	subscribeEcho(t, pn, "test.json")
+
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(context.Background(), "test.json", wrapperspb.String("hello"), resp))
+	assert.Equal(t, "hello back", resp.Value)
+}
+
+func TestSubscribe_BadPayload(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	subscribeEcho(t, pn, "test.badpayload")
+
+	reply, err := pn.NatsConn().Request("test.badpayload", []byte{0xff, 0xfe, 0xfd}, time.Second)
 	require.NoError(t, err)
+	herr := errorFromHeaders(reply.Header)
+	var pnErr *Error
+	require.ErrorAs(t, herr, &pnErr)
+	assert.Equal(t, 400, pnErr.Code)
+}
+
+func TestSubscribe_NilResponse(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	sub, err := pn.Subscribe("test.Method", "test.nilresp", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			return nil, nil
+		})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(context.Background(), "test.nilresp", wrapperspb.String("x"), resp))
+	assert.Empty(t, resp.Value)
+}
+
+func TestSubscribe_ContextValues(t *testing.T) {
+	pn, _ := New(connectNats(t))
 
 	var gotSubject string
-	sub, err := pn.Subscribe("test.ctx", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		gotSubject = SubjectFromContext(ctx)
-		return wrapperspb.String("ok"), nil
-	})
+	var gotMsg *nats.Msg
+	sub, err := pn.Subscribe("test.Method", "test.ctx", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			gotSubject = SubjectFromContext(ctx)
+			gotMsg = MsgFromContext(ctx)
+			return req, nil
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
 	require.NoError(t, pn.Request(context.Background(), "test.ctx", wrapperspb.String("x"), &wrapperspb.StringValue{}))
 	assert.Equal(t, "test.ctx", gotSubject)
+	require.NotNil(t, gotMsg)
+	assert.Equal(t, "test.ctx", gotMsg.Subject)
 }
 
-func TestRegistration(t *testing.T) {
-	nc := connectNats(t)
-	sub1, _ := nc.Subscribe("test.r.1", func(*nats.Msg) {})
-	sub2, _ := nc.Subscribe("test.r.2", func(*nats.Msg) {})
-
-	reg := &Registration{}
-	reg.AddSubscription(sub1)
-	reg.AddSubscription(sub2)
-
-	assert.True(t, sub1.IsValid())
-	require.NoError(t, reg.Unsubscribe())
-	assert.False(t, sub1.IsValid())
-	assert.False(t, sub2.IsValid())
-}
-
-func TestHandlerOptions(t *testing.T) {
-	ho := ApplyHandlerOptions([]HandlerOption{WithQueueGroup("grp")})
-	assert.Equal(t, "grp", ho.QueueGroup)
-}
-
-
-// Edge cases
-
-func TestNew_DefaultCodec(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-	assert.Equal(t, "application/protobuf", pn.Codec().ContentType())
-}
-
-func TestNew_DefaultTimeout(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-	assert.Equal(t, 5*time.Second, pn.defaultTimeout)
-}
-
-func TestNew_CustomTimeout(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc, WithDefaultTimeout(10*time.Second))
-	require.NoError(t, err)
-	assert.Equal(t, 10*time.Second, pn.defaultTimeout)
-}
-
-func TestPublish_WithHeaders(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	var gotHeaders nats.Header
-	done := make(chan struct{})
-
-	sub, err := nc.Subscribe("test.pub.headers", func(m *nats.Msg) {
-		gotHeaders = m.Header
-		close(done)
-	})
+func TestSubscribe_HandlerErrorWithoutReplyIsLogged(t *testing.T) {
+	logger := &testLogger{}
+	pn, _ := New(connectNats(t), WithLogger(logger))
+	sub, err := pn.Subscribe("test.Method", "test.noreply", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			return nil, fmt.Errorf("dropped error")
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	err = pn.Publish(context.Background(), "test.pub.headers", wrapperspb.String("hi"),
-		WithHeaders(nats.Header{"X-Custom": []string{"val"}}))
-	require.NoError(t, err)
+	// Plain publish: no reply subject, so the error has nowhere to go but the log.
+	require.NoError(t, pn.Publish(context.Background(), "test.noreply", wrapperspb.String("x")))
+	require.Eventually(t, func() bool { return logger.contains("dropped error") }, 2*time.Second, 10*time.Millisecond)
+}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+// ── Queue groups ──
+
+func TestSubscribe_DefaultQueueGroupLoadBalances(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	var handled atomic.Int32
+	countingHandler := func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		handled.Add(1)
+		return req, nil
 	}
-	assert.Equal(t, "val", gotHeaders.Get("X-Custom"))
-}
-
-func TestPublish_SubjectOverride(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	done := make(chan struct{})
-	sub, err := nc.Subscribe("actual.subject", func(m *nats.Msg) {
-		close(done)
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	err = pn.Publish(context.Background(), "wrong.subject", wrapperspb.String("x"),
-		WithSubject("actual.subject"))
-	require.NoError(t, err)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	for i := 0; i < 2; i++ {
+		sub, err := pn.Subscribe("test.Method", "test.qgdefault", HandlerOptions{}, newStringValue, countingHandler)
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
 	}
+
+	const requests = 10
+	for i := 0; i < requests; i++ {
+		require.NoError(t, pn.Request(context.Background(), "test.qgdefault", wrapperspb.String("x"), &wrapperspb.StringValue{}))
+	}
+
+	// With the default queue group, each request is handled exactly once even
+	// with two live subscriptions.
+	assert.Equal(t, int32(requests), handled.Load())
 }
 
-func TestRequest_WithHeaders(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
+func TestSubscribe_WithNoQueueGroupFansOut(t *testing.T) {
+	pn, _ := New(connectNats(t))
 
-	var gotHeader string
-	sub, err := pn.Subscribe("test.req.headers", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		gotHeader = m.Header.Get("X-Test")
-		return wrapperspb.String("ok"), nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
+	var handled atomic.Int32
+	ho := ApplyHandlerOptions([]HandlerOption{WithNoQueueGroup()})
+	for i := 0; i < 2; i++ {
+		sub, err := pn.Subscribe("test.Method", "test.qgnone", ho, newStringValue,
+			func(ctx context.Context, req proto.Message) (proto.Message, error) {
+				handled.Add(1)
+				return req, nil
+			})
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
+	}
 
-	resp := &wrapperspb.StringValue{}
-	err = pn.Request(context.Background(), "test.req.headers", wrapperspb.String("x"), resp,
-		WithHeaders(nats.Header{"X-Test": []string{"hello"}}))
-	require.NoError(t, err)
-	assert.Equal(t, "hello", gotHeader)
+	require.NoError(t, pn.Request(context.Background(), "test.qgnone", wrapperspb.String("x"), &wrapperspb.StringValue{}))
+
+	require.Eventually(t, func() bool { return handled.Load() == 2 }, 2*time.Second, 10*time.Millisecond)
 }
 
-func TestRequest_HandlerPlainError(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
+// ── Publish / SubscribePublish ──
 
-	sub, err := pn.Subscribe("test.planerr", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return nil, assert.AnError // plain Go error, not *Error
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
+func TestPublish(t *testing.T) {
+	pn, _ := New(connectNats(t))
 
-	err = pn.Request(context.Background(), "test.planerr", wrapperspb.String("x"), &wrapperspb.StringValue{})
-	var pnErr *Error
-	require.ErrorAs(t, err, &pnErr)
-	assert.Equal(t, 500, pnErr.Code) // plain errors become 500
-}
-
-func TestSubscribe_BadPayload(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	// Handler for request/reply that receives invalid protobuf
-	sub, err := pn.Subscribe("test.badpayload", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		t.Fatal("handler should not be called with bad payload")
-		return nil, nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	// Send garbage data as a request
-	resp, err := nc.Request("test.badpayload", []byte("not protobuf!@#$"), time.Second)
-	require.NoError(t, err)
-	// Should get a 400 error back
-	assert.Equal(t, "400", resp.Header.Get(headerErrorCode))
-}
-
-func TestSubscribePublish_BadPayload(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	handlerCalled := false
-	sub, err := pn.SubscribePublish("test.badpub", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, req proto.Message) error {
-		handlerCalled = true
-		return nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	// Publish garbage
-	require.NoError(t, nc.Publish("test.badpub", []byte("garbage")))
-	nc.Flush()
-	time.Sleep(100 * time.Millisecond)
-	assert.False(t, handlerCalled)
-}
-
-func TestSubscribePublish_WithQueueGroup(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	var count int
-	var mu sync.Mutex
-	done := make(chan struct{}, 2)
-
-	newHandler := func() (*nats.Subscription, error) {
-		return pn.SubscribePublish("test.pubq", "workers", func() proto.Message {
-			return &wrapperspb.StringValue{}
-		}, func(ctx context.Context, req proto.Message) error {
-			mu.Lock()
-			count++
-			mu.Unlock()
-			done <- struct{}{}
+	done := make(chan string, 1)
+	sub, err := pn.SubscribePublish("test.Method", "test.pub", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) error {
+			done <- req.(*wrapperspb.StringValue).Value
 			return nil
 		})
-	}
-
-	sub1, err := newHandler()
 	require.NoError(t, err)
-	sub2, err := newHandler()
-	require.NoError(t, err)
-	defer sub1.Unsubscribe()
-	defer sub2.Unsubscribe()
+	defer sub.Unsubscribe()
 
-	require.NoError(t, pn.Publish(context.Background(), "test.pubq", wrapperspb.String("x")))
+	require.NoError(t, pn.Publish(context.Background(), "test.pub", wrapperspb.String("fire")))
+
 	select {
-	case <-done:
+	case v := <-done:
+		assert.Equal(t, "fire", v)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout")
 	}
-	time.Sleep(50 * time.Millisecond) // extra wait for potential duplicate
-
-	mu.Lock()
-	assert.Equal(t, 1, count) // queue group ensures only one gets it
-	mu.Unlock()
 }
 
-func TestSubscribePublish_HandlerPanic(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
+func TestPublish_CancelledContext(t *testing.T) {
+	pn, _ := New(connectNats(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	done := make(chan struct{})
-	sub, err := pn.SubscribePublish("test.pubpanic", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, req proto.Message) error {
-		defer close(done)
-		panic("boom")
-	})
+	err := pn.Publish(ctx, "test.cancelled", wrapperspb.String("x"))
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestSubscribePublish_DistinctMethodsEachGetACopy(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	// Two different services consuming the same event: distinct method names
+	// mean distinct queue groups, so each must receive every message.
+	var a, b atomic.Int32
+	counters := map[string]*atomic.Int32{"pkg.A.OnEvent": &a, "pkg.B.OnEvent": &b}
+	for method, counter := range counters {
+		sub, err := pn.SubscribePublish(method, "test.fanout", HandlerOptions{}, newStringValue,
+			func(ctx context.Context, req proto.Message) error {
+				counter.Add(1)
+				return nil
+			})
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
+	}
+
+	require.NoError(t, pn.Publish(context.Background(), "test.fanout", wrapperspb.String("x")))
+	require.Eventually(t, func() bool { return a.Load() == 1 && b.Load() == 1 }, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestSubscribePublish_SameMethodLoadBalances(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	// Two instances of the same service: one method name, so the default queue
+	// group balances instead of double-processing.
+	var received atomic.Int32
+	for i := 0; i < 2; i++ {
+		sub, err := pn.SubscribePublish("pkg.Svc.OnEvent", "test.pubbalance", HandlerOptions{}, newStringValue,
+			func(ctx context.Context, req proto.Message) error {
+				received.Add(1)
+				return nil
+			})
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
+	}
+
+	const messages = 10
+	for i := 0; i < messages; i++ {
+		require.NoError(t, pn.Publish(context.Background(), "test.pubbalance", wrapperspb.String("x")))
+	}
+	require.Eventually(t, func() bool { return received.Load() == messages }, 2*time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(messages), received.Load())
+}
+
+// TestSubscribe_OverlappingSubjectsDoNotSteal is the regression guard for the
+// queue-group scoping rule: NATS groups queue subscribers by queue name across
+// every subject pattern matching the delivered subject. A shared queue name
+// would put the wildcard and literal handlers in one group, and the wildcard
+// handler would swallow roughly half of the literal subject's requests.
+//
+// The subjects are namespaced to this test: `go test ./...` runs packages in
+// parallel against one server, and internal/e2e subscribes "items.*".
+func TestSubscribe_OverlappingSubjectsDoNotSteal(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	var wildcard, literal atomic.Int32
+	subs := []struct {
+		method, subject string
+		counter         *atomic.Int32
+	}{
+		{"pkg.Svc.GetItem", "overlap.*", &wildcard},
+		{"pkg.Svc.ListItems", "overlap.list", &literal},
+	}
+	for _, s := range subs {
+		counter := s.counter
+		sub, err := pn.Subscribe(s.method, s.subject, HandlerOptions{}, newStringValue,
+			func(ctx context.Context, req proto.Message) (proto.Message, error) {
+				counter.Add(1)
+				return req, nil
+			})
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
+	}
+
+	const requests = 20
+	for i := 0; i < requests; i++ {
+		require.NoError(t, pn.Request(context.Background(), "overlap.list", wrapperspb.String("x"), &wrapperspb.StringValue{}))
+	}
+
+	// Both subscriptions match, so both must see every message. A request
+	// returns on whichever reply arrives first, so the other handler can still
+	// be running — wait for both counts rather than reading them immediately.
+	require.Eventually(t, func() bool {
+		return literal.Load() == requests && wildcard.Load() == requests
+	}, 2*time.Second, 10*time.Millisecond,
+		"nothing may be stolen: literal=%d wildcard=%d, want %d each", literal.Load(), wildcard.Load(), requests)
+}
+
+func TestSubscribePublish_QueueGroupLoadBalances(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	var received atomic.Int32
+	ho := ApplyHandlerOptions([]HandlerOption{WithQueueGroup("workers")})
+	for i := 0; i < 2; i++ {
+		sub, err := pn.SubscribePublish("test.Method", "test.qgpub", ho, newStringValue,
+			func(ctx context.Context, req proto.Message) error {
+				received.Add(1)
+				return nil
+			})
+		require.NoError(t, err)
+		defer sub.Unsubscribe()
+	}
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, pn.Publish(context.Background(), "test.qgpub", wrapperspb.String("x")))
+	}
+	require.Eventually(t, func() bool { return received.Load() == 10 }, 2*time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(10), received.Load())
+}
+
+func TestSubscribePublish_BadPayloadLogged(t *testing.T) {
+	logger := &testLogger{}
+	pn, _ := New(connectNats(t), WithLogger(logger))
+
+	handled := false
+	sub, err := pn.SubscribePublish("test.Method", "test.pubbad", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) error {
+			handled = true
+			return nil
+		})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	require.NoError(t, pn.NatsConn().Publish("test.pubbad", []byte{0xff, 0xfe}))
+	require.Eventually(t, func() bool { return logger.contains("unmarshal error") }, 2*time.Second, 10*time.Millisecond)
+	assert.False(t, handled)
+}
+
+func TestSubscribePublish_PanicRecovered(t *testing.T) {
+	logger := &testLogger{}
+	pn, _ := New(connectNats(t), WithLogger(logger))
+
+	sub, err := pn.SubscribePublish("test.Method", "test.pubpanic", HandlerOptions{}, newStringValue,
+		func(ctx context.Context, req proto.Message) error {
+			panic("pub kaboom")
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
 	require.NoError(t, pn.Publish(context.Background(), "test.pubpanic", wrapperspb.String("x")))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
-	}
-	// If we get here, the panic was recovered (no crash)
+	require.Eventually(t, func() bool { return logger.contains("panic") }, 2*time.Second, 10*time.Millisecond)
 }
 
-func TestSubscribe_NoReply(t *testing.T) {
-	// Test that a Subscribe handler receiving a message without reply subject
-	// does not crash — it just calls the handler and discards the result.
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
+// ── Interceptors ──
 
-	done := make(chan struct{})
-	sub, err := pn.Subscribe("test.noreply", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		close(done)
-		return wrapperspb.String("result"), nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	// Publish (not Request) so there's no reply subject
-	data, _ := proto.Marshal(wrapperspb.String("hello"))
-	require.NoError(t, nc.Publish("test.noreply", data))
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
-	}
-}
-
-func TestSubscribe_HandlerReturnsNilResponse(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	sub, err := pn.Subscribe("test.nilresp", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return nil, nil // nil response, no error
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	resp, err := nc.Request("test.nilresp", []byte{}, time.Second)
-	require.NoError(t, err)
-	// Should get an empty reply (no error headers, no data)
-	assert.Empty(t, resp.Header.Get(headerError))
-	assert.Empty(t, resp.Data)
-}
-
-func TestSubscribe_ContextHasSubjectAndMsg(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc)
-	require.NoError(t, err)
-
-	var gotSubject string
-	var gotMsg *nats.Msg
-	sub, err := pn.Subscribe("test.ctxfull", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		gotSubject = SubjectFromContext(ctx)
-		gotMsg = MsgFromContext(ctx)
-		return wrapperspb.String("ok"), nil
-	})
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	require.NoError(t, pn.Request(context.Background(), "test.ctxfull", wrapperspb.String("x"), &wrapperspb.StringValue{}))
-	assert.Equal(t, "test.ctxfull", gotSubject)
-	assert.NotNil(t, gotMsg)
-	assert.Equal(t, "test.ctxfull", gotMsg.Subject)
-}
-
-func TestClientInterceptor(t *testing.T) {
+func TestClientInterceptors_RunInOrderWithMethodName(t *testing.T) {
 	nc := connectNats(t)
 
-	var interceptedMethod string
-	interceptor := func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
-		interceptedMethod = method
-		return next(ctx, subject, req)
+	var order []string
+	mkInterceptor := func(name string) ClientInterceptor {
+		return func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			order = append(order, name+":"+method+":"+subject)
+			return next(ctx, subject, req)
+		}
 	}
 
-	pn, err := New(nc, WithClientInterceptor(interceptor))
+	pn, err := New(nc, WithClientInterceptor(mkInterceptor("outer")), WithClientInterceptor(mkInterceptor("inner")))
 	require.NoError(t, err)
-	// Verify interceptor was added
-	assert.Len(t, pn.clientInterceptors, 1)
+	subscribeEcho(t, pn, "test.ic")
 
-	// The interceptor is stored but the current Request/Publish don't call it
-	// (interceptor chain is wired in generated code). Just verify it's registered.
-	_ = interceptedMethod
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, pn.Request(context.Background(), "test.ic", wrapperspb.String("x"), resp, WithMethodName("pkg.Svc.Do")))
+
+	require.Equal(t, []string{"outer:pkg.Svc.Do:test.ic", "inner:pkg.Svc.Do:test.ic"}, order)
+	assert.Equal(t, "x back", resp.Value)
 }
 
-func TestRequest_JSONCodec(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc, WithCodec(JSONCodec))
+func TestClientInterceptor_MethodDefaultsToSubject(t *testing.T) {
+	var gotMethod string
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			gotMethod = method
+			return next(ctx, subject, req)
+		}))
+	require.NoError(t, err)
+	subscribeEcho(t, pn, "test.icdefault")
+
+	require.NoError(t, pn.Request(context.Background(), "test.icdefault", wrapperspb.String("x"), &wrapperspb.StringValue{}))
+	assert.Equal(t, "test.icdefault", gotMethod)
+}
+
+func TestClientInterceptor_ShortCircuit(t *testing.T) {
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			return nil, Errorf(403, "blocked")
+		}))
 	require.NoError(t, err)
 
-	sub, err := pn.Subscribe("test.json", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, m *nats.Msg, req proto.Message) (proto.Message, error) {
-		return wrapperspb.String(req.(*wrapperspb.StringValue).Value + " json"), nil
+	// No subscription exists; the interceptor must block before the wire.
+	err = pn.Request(context.Background(), "test.blocked", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	var pnErr *Error
+	require.ErrorAs(t, err, &pnErr)
+	assert.Equal(t, 403, pnErr.Code)
+}
+
+func TestClientInterceptor_Publish(t *testing.T) {
+	var called bool
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			called = true
+			return next(ctx, subject, req)
+		}))
+	require.NoError(t, err)
+
+	require.NoError(t, pn.Publish(context.Background(), "test.icpub", wrapperspb.String("x")))
+	assert.True(t, called)
+}
+
+func TestHandlerInterceptors_RunInOrder(t *testing.T) {
+	pn, _ := New(connectNats(t))
+
+	var order []string
+	mkInterceptor := func(name string) HandlerInterceptor {
+		return func(ctx context.Context, method, subject string, req proto.Message, next HandlerInvoker) (proto.Message, error) {
+			order = append(order, name+":"+method+":"+subject)
+			return next(ctx, req)
+		}
+	}
+	ho := ApplyHandlerOptions([]HandlerOption{
+		WithHandlerInterceptor(mkInterceptor("outer")),
+		WithHandlerInterceptor(mkInterceptor("inner")),
 	})
+
+	sub, err := pn.Subscribe("pkg.Svc.Do", "test.hic", ho, newStringValue, echoHandler)
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
 	resp := &wrapperspb.StringValue{}
-	require.NoError(t, pn.Request(context.Background(), "test.json", wrapperspb.String("hello"), resp))
-	assert.Equal(t, "hello json", resp.Value)
+	require.NoError(t, pn.Request(context.Background(), "test.hic", wrapperspb.String("x"), resp))
+	require.Equal(t, []string{"outer:pkg.Svc.Do:test.hic", "inner:pkg.Svc.Do:test.hic"}, order)
 }
 
-func TestPublish_JSONCodec(t *testing.T) {
-	nc := connectNats(t)
-	pn, err := New(nc, WithCodec(JSONCodec))
-	require.NoError(t, err)
+func TestHandlerInterceptor_ShortCircuit(t *testing.T) {
+	pn, _ := New(connectNats(t))
 
-	done := make(chan string)
-	sub, err := pn.SubscribePublish("test.jsonpub", "", func() proto.Message {
-		return &wrapperspb.StringValue{}
-	}, func(ctx context.Context, req proto.Message) error {
-		done <- req.(*wrapperspb.StringValue).Value
-		return nil
+	handlerCalled := false
+	ho := ApplyHandlerOptions([]HandlerOption{
+		WithHandlerInterceptor(func(ctx context.Context, method, subject string, req proto.Message, next HandlerInvoker) (proto.Message, error) {
+			return nil, Errorf(401, "denied")
+		}),
 	})
+	sub, err := pn.Subscribe("test.Method", "test.hicblock", ho, newStringValue,
+		func(ctx context.Context, req proto.Message) (proto.Message, error) {
+			handlerCalled = true
+			return req, nil
+		})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	require.NoError(t, pn.Publish(context.Background(), "test.jsonpub", wrapperspb.String("json-msg")))
+	err = pn.Request(context.Background(), "test.hicblock", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	var pnErr *Error
+	require.ErrorAs(t, err, &pnErr)
+	assert.Equal(t, 401, pnErr.Code)
+	assert.False(t, handlerCalled)
+}
 
-	select {
-	case v := <-done:
-		assert.Equal(t, "json-msg", v)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
-	}
+func TestContextHelpers_ZeroValues(t *testing.T) {
+	ctx := context.Background()
+	assert.Equal(t, "", SubjectFromContext(ctx))
+	assert.Nil(t, MsgFromContext(ctx))
+}
+
+func TestClientInterceptor_SubstitutesResponse(t *testing.T) {
+	// An interceptor that short-circuits (cache hit, fallback) supplies its own
+	// response; it must reach the caller instead of leaving them a zero value.
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			return wrapperspb.String("from cache"), nil
+		}))
+	require.NoError(t, err)
+
+	resp := &wrapperspb.StringValue{}
+	// No subscription exists: only the interceptor can produce this answer.
+	require.NoError(t, pn.Request(context.Background(), "test.substituted", wrapperspb.String("x"), resp))
+	assert.Equal(t, "from cache", resp.Value)
+}
+
+func TestClientInterceptor_SubstitutesWrongType(t *testing.T) {
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			return wrapperspb.Int32(42), nil
+		}))
+	require.NoError(t, err)
+
+	err = pn.Request(context.Background(), "test.wrongtype", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Int32Value")
+}
+
+func TestPublishJetStream_InterceptorShortCircuitIsAnError(t *testing.T) {
+	// Without an ack there is nothing to return, and callers dereference the
+	// result — so this must be an error rather than (nil, nil).
+	pn, err := New(connectNats(t), WithClientInterceptor(
+		func(ctx context.Context, method, subject string, req proto.Message, next ClientInvoker) (proto.Message, error) {
+			return nil, nil
+		}))
+	require.NoError(t, err)
+
+	ack, err := pn.PublishJetStream(context.Background(), "test.js.shortcircuit", wrapperspb.String("x"))
+	assert.Nil(t, ack)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "short-circuited")
 }

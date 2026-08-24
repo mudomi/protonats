@@ -7,9 +7,9 @@
 package protonats
 
 import (
-	descriptor "github.com/golang/protobuf/protoc-gen-go/descriptor"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 	reflect "reflect"
 	sync "sync"
 )
@@ -81,7 +81,8 @@ type ServiceOptions struct {
 
 	// Subject prefix for all methods. Default: proto package name.
 	SubjectPrefix string `protobuf:"bytes,1,opt,name=subject_prefix,json=subjectPrefix,proto3" json:"subject_prefix,omitempty"`
-	// Enable NATS micro service discovery.
+	// ROADMAP — not yet implemented; the plugin fails when set.
+	// Reserved for NATS micro service discovery.
 	Micro bool `protobuf:"varint,2,opt,name=micro,proto3" json:"micro,omitempty"`
 	// Service version for micro discovery (semver). Required if micro is true.
 	Version string `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
@@ -280,6 +281,8 @@ type MessageOptions struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
+	// ROADMAP — not yet implemented; the plugin fails when set.
+	// Reserved for typed KV store helpers.
 	Kv *KVOptions `protobuf:"bytes,1,opt,name=kv,proto3" json:"kv,omitempty"`
 }
 
@@ -381,7 +384,7 @@ func (x *KVOptions) GetKeyTemplate() string {
 
 var file_protonats_options_proto_extTypes = []protoimpl.ExtensionInfo{
 	{
-		ExtendedType:  (*descriptor.ServiceOptions)(nil),
+		ExtendedType:  (*descriptorpb.ServiceOptions)(nil),
 		ExtensionType: (*ServiceOptions)(nil),
 		Field:         50100,
 		Name:          "protonats.service",
@@ -389,7 +392,7 @@ var file_protonats_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Filename:      "protonats/options.proto",
 	},
 	{
-		ExtendedType:  (*descriptor.MethodOptions)(nil),
+		ExtendedType:  (*descriptorpb.MethodOptions)(nil),
 		ExtensionType: (*MethodOptions)(nil),
 		Field:         50100,
 		Name:          "protonats.method",
@@ -397,7 +400,7 @@ var file_protonats_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Filename:      "protonats/options.proto",
 	},
 	{
-		ExtendedType:  (*descriptor.FieldOptions)(nil),
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
 		ExtensionType: (*FieldOptions)(nil),
 		Field:         50100,
 		Name:          "protonats.field",
@@ -405,7 +408,7 @@ var file_protonats_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Filename:      "protonats/options.proto",
 	},
 	{
-		ExtendedType:  (*descriptor.MessageOptions)(nil),
+		ExtendedType:  (*descriptorpb.MessageOptions)(nil),
 		ExtensionType: (*MessageOptions)(nil),
 		Field:         50100,
 		Name:          "protonats.message",
@@ -414,25 +417,25 @@ var file_protonats_options_proto_extTypes = []protoimpl.ExtensionInfo{
 	},
 }
 
-// Extension fields to descriptor.ServiceOptions.
+// Extension fields to descriptorpb.ServiceOptions.
 var (
 	// optional protonats.ServiceOptions service = 50100;
 	E_Service = &file_protonats_options_proto_extTypes[0]
 )
 
-// Extension fields to descriptor.MethodOptions.
+// Extension fields to descriptorpb.MethodOptions.
 var (
 	// optional protonats.MethodOptions method = 50100;
 	E_Method = &file_protonats_options_proto_extTypes[1]
 )
 
-// Extension fields to descriptor.FieldOptions.
+// Extension fields to descriptorpb.FieldOptions.
 var (
 	// optional protonats.FieldOptions field = 50100;
 	E_Field = &file_protonats_options_proto_extTypes[2]
 )
 
-// Extension fields to descriptor.MessageOptions.
+// Extension fields to descriptorpb.MessageOptions.
 var (
 	// optional protonats.MessageOptions message = 50100;
 	E_Message = &file_protonats_options_proto_extTypes[3]
@@ -522,16 +525,16 @@ func file_protonats_options_proto_rawDescGZIP() []byte {
 var file_protonats_options_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_protonats_options_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_protonats_options_proto_goTypes = []any{
-	(MethodType)(0),                   // 0: protonats.MethodType
-	(*ServiceOptions)(nil),            // 1: protonats.ServiceOptions
-	(*MethodOptions)(nil),             // 2: protonats.MethodOptions
-	(*FieldOptions)(nil),              // 3: protonats.FieldOptions
-	(*MessageOptions)(nil),            // 4: protonats.MessageOptions
-	(*KVOptions)(nil),                 // 5: protonats.KVOptions
-	(*descriptor.ServiceOptions)(nil), // 6: google.protobuf.ServiceOptions
-	(*descriptor.MethodOptions)(nil),  // 7: google.protobuf.MethodOptions
-	(*descriptor.FieldOptions)(nil),   // 8: google.protobuf.FieldOptions
-	(*descriptor.MessageOptions)(nil), // 9: google.protobuf.MessageOptions
+	(MethodType)(0),                     // 0: protonats.MethodType
+	(*ServiceOptions)(nil),              // 1: protonats.ServiceOptions
+	(*MethodOptions)(nil),               // 2: protonats.MethodOptions
+	(*FieldOptions)(nil),                // 3: protonats.FieldOptions
+	(*MessageOptions)(nil),              // 4: protonats.MessageOptions
+	(*KVOptions)(nil),                   // 5: protonats.KVOptions
+	(*descriptorpb.ServiceOptions)(nil), // 6: google.protobuf.ServiceOptions
+	(*descriptorpb.MethodOptions)(nil),  // 7: google.protobuf.MethodOptions
+	(*descriptorpb.FieldOptions)(nil),   // 8: google.protobuf.FieldOptions
+	(*descriptorpb.MessageOptions)(nil), // 9: google.protobuf.MessageOptions
 }
 var file_protonats_options_proto_depIdxs = []int32{
 	0,  // 0: protonats.MethodOptions.type:type_name -> protonats.MethodType

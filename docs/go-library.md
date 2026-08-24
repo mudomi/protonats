@@ -1,173 +1,68 @@
-# ProtoNats Go Library Guide
+# Go Library Guide
 
-This document describes how to use the generated Go code and the `protonats` runtime package.
+Using the generated Go code and the `protonats` runtime. See the
+[README](../README.md) for installation and code generation.
 
-## Installation
+## Connection
 
-```bash
-go get github.com/mudomi/protonats
-go install github.com/mudomi/protonats/cmd/protoc-gen-protonats@latest
-```
-
-## Code Generation
-
-```bash
-protoc \
-  --go_out=gen --go_opt=paths=source_relative \
-  --protonats_out=gen --protonats_opt=paths=source_relative \
-  -I proto \
-  proto/myapp/orders/orders.proto
-```
-
-Produces per proto file:
-- `orders.pb.go` -- Standard protobuf types (from `protoc-gen-go`)
-- `orders_protonats.pb.go` -- ProtoNats clients, handlers, subjects, KV helpers
-
----
-
-## Connection Setup
-
-ProtoNats wraps a `*nats.Conn`. It does not own the connection -- you create it, you close it.
+ProtoNats wraps a `*nats.Conn` and never takes ownership — you create it, you
+close it.
 
 ```go
-import (
-    "github.com/nats-io/nats.go"
-    "github.com/mudomi/protonats"
-)
-
-func main() {
-    nc, err := nats.Connect("nats://localhost:4222",
-        nats.Name("my-service"),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer nc.Drain()
-
-    pn, err := protonats.New(nc)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // ... use pn to create clients and register handlers
+nc, err := nats.Connect("nats://localhost:4222", nats.Name("my-service"))
+if err != nil {
+    log.Fatal(err)
 }
+defer nc.Drain()
+
+pn, err := protonats.New(nc)
 ```
 
-If you need JetStream (for `JETSTREAM_PUBLISH`, `JETSTREAM_CONSUME`, or KV):
+| Option | Description |
+|---|---|
+| `WithDefaultTimeout(d)` | Timeout for requests and JetStream acks (default 5s) |
+| `WithCodec(c)` | Serialization; `protonats.JSONCodec` for JSON interop |
+| `WithClientInterceptor(i)` | Add a client interceptor (repeatable) |
+| `WithLogger(l)` | Logger for errors with no caller to return to; `nil` disables |
 
-```go
-pn, err := protonats.New(nc, protonats.WithJetStream())
-```
+Nothing is hidden: `pn.NatsConn()` returns the `*nats.Conn` and
+`pn.JetStream()` the JetStream context (created on first use). Use them for
+anything ProtoNats does not cover — KV, object store, stream management.
 
-### Accessing Raw NATS
-
-ProtoNats never hides the underlying connections:
-
-```go
-nc := pn.NatsConn()       // *nats.Conn
-js := pn.JetStream()      // jetstream.JetStream (nil if WithJetStream not used)
-```
-
-This is the escape hatch for anything ProtoNats doesn't cover: object stores, complex stream management, raw subscriptions, or any other NATS feature.
-
----
-
-## Using Generated Clients
-
-For each service, ProtoNats generates a client struct.
-
-### Request/Response
+## Clients
 
 ```go
 client := orders.NewOrderServiceClient(pn)
 
-resp, err := client.GetOrder(ctx, &orders.GetOrderRequest{
-    OrderId: "ord_abc123",
-})
-if err != nil {
-    log.Fatal(err)
-}
-log.Printf("Order status: %s", resp.Status)
+// Request/reply
+order, err := client.GetOrder(ctx, &orders.GetOrderRequest{OrderId: "abc"})
+
+// Publish — err covers serialization and publish failure only
+err = client.OrderCreated(ctx, &orders.OrderCreatedEvent{Order: order})
+
+// JetStream publish — waits for the server ack
+ack, err := client.EmitOrderEvent(ctx, &orders.OrderEvent{})
+log.Printf("persisted to %s seq %d", ack.Stream, ack.Sequence)
 ```
 
-The generated code handles serialization, subject construction (including dynamic segment interpolation), the NATS request/reply exchange, error header checking, and response deserialization.
+Subject construction, serialization, error headers, and response decoding are
+all handled by the generated code.
 
-### Publish (fire-and-forget)
+Per-call options: `WithTimeout(d)`, `WithHeaders(h)`, and `WithSubject(s)` to
+override the resolved subject entirely.
 
-```go
-err := client.OrderCreated(ctx, &orders.OrderCreatedEvent{
-    Order:     myOrder,
-    Timestamp: time.Now().UnixMilli(),
-})
-// err is only from serialization or publish failure
-```
+## Handlers
 
-### JetStream Publish
-
-```go
-ack, err := client.OrderCreated(ctx, &orders.OrderCreatedEvent{
-    Order: myOrder,
-})
-if err != nil {
-    log.Fatal(err)
-}
-log.Printf("Persisted to %s seq %d", ack.Stream, ack.Sequence)
-```
-
-### Per-Call Options
-
-Override defaults on individual calls:
-
-```go
-resp, err := client.GetOrder(ctx, req,
-    protonats.WithTimeout(2 * time.Second),
-    protonats.WithHeaders(nats.Header{
-        "X-Request-Id": []string{requestId},
-    }),
-)
-```
-
-| Option | Description |
-|--------|-------------|
-| `WithTimeout(d)` | Override request timeout for this call |
-| `WithHeaders(h)` | Add NATS headers to this message |
-| `WithSubject(s)` | Completely override the resolved subject |
-
----
-
-## Implementing Handlers
-
-For each service, ProtoNats generates a handler interface and a registration function.
-
-### The Handler Interface
-
-```go
-// Generated
-type OrderServiceHandler interface {
-    GetOrder(ctx context.Context, req *GetOrderRequest) (*Order, error)
-    Create(ctx context.Context, req *CreateOrderRequest) (*Order, error)
-    ProcessOrderEvent(ctx context.Context, msg *OrderCreatedEvent, ack protonats.Acker) error
-}
-```
-
-Note: `OrderCreated` (JETSTREAM_PUBLISH) does not appear -- it's client/publish-only.
-
-### Forward Compatibility
-
-ProtoNats generates an `UnimplementedOrderServiceHandler` struct (following the gRPC pattern). Embed it to avoid breakage when new methods are added to the service:
+Implement the generated interface and register it. Embed the generated
+`Unimplemented…Handler` so that adding a method to the service does not break
+compilation; its methods return `protonats.Errorf(501, "not implemented")`.
 
 ```go
 type orderHandler struct {
     orders.UnimplementedOrderServiceHandler
     db *sql.DB
 }
-```
 
-Methods on `Unimplemented*` return `protonats.Errorf(501, "not implemented")`.
-
-### Implementation
-
-```go
 func (h *orderHandler) GetOrder(ctx context.Context, req *orders.GetOrderRequest) (*orders.Order, error) {
     order, err := h.db.GetOrder(ctx, req.OrderId)
     if err != nil {
@@ -176,205 +71,108 @@ func (h *orderHandler) GetOrder(ctx context.Context, req *orders.GetOrderRequest
     return order, nil
 }
 
-func (h *orderHandler) Create(ctx context.Context, req *orders.CreateOrderRequest) (*orders.Order, error) {
-    order, err := h.db.CreateOrder(ctx, req)
-    if err != nil {
-        return nil, protonats.Errorf(500, "failed to create: %v", err)
-    }
-    return order, nil
-}
-
-func (h *orderHandler) ProcessOrderEvent(ctx context.Context, msg *orders.OrderCreatedEvent, ack protonats.Acker) error {
-    if err := h.indexOrder(ctx, msg.Order); err != nil {
-        return err // NAK'd for redelivery
-    }
-    return nil // auto-acked
-}
-```
-
-### Registration
-
-```go
-reg, err := orders.RegisterOrderServiceHandler(pn, handler)
+reg, err := orders.RegisterOrderServiceHandler(pn, &orderHandler{db: db})
 if err != nil {
     log.Fatal(err)
 }
 defer reg.Drain()
 ```
 
-### Registration Options
+Registration is atomic: if any subscription or consumer fails to start,
+everything already registered is torn down and an error is returned.
 
-All operational configuration happens here, not in proto:
+Handlers can read NATS metadata from the context:
 
 ```go
-reg, err := orders.RegisterOrderServiceHandler(pn, handler,
-    // Queue group for load balancing (all request/reply + publish handlers)
-    protonats.WithQueueGroup("order-svc"),
-
-    // JetStream consumer configuration
-    protonats.WithConsumerConfig("ProcessOrderEvent", jetstream.ConsumerConfig{
-        AckPolicy:     jetstream.AckExplicitPolicy,
-        MaxDeliver:    5,
-        MaxAckPending: 100,
-        AckWait:       30 * time.Second,
-        DeliverPolicy: jetstream.DeliverNewPolicy,
-        FilterSubject: "events.orders.>",
-    }),
-
-    // Override subject for a specific method
-    protonats.WithSubjectOverride("GetOrder", "legacy.orders.{order_id}"),
-)
+subject := protonats.SubjectFromContext(ctx)  // concrete subject, wildcards resolved
+msg := protonats.MsgFromContext(ctx)          // raw *nats.Msg; nil in JetStream consumers
 ```
+
+### Registration options
 
 | Option | Description |
-|--------|-------------|
-| `WithQueueGroup(q)` | Set queue group for all handler subscriptions. If empty, no queue group. |
-| `WithConsumerConfig(method, cfg)` | Override JetStream consumer config for a specific JETSTREAM_CONSUME method. |
-| `WithSubjectOverride(method, subj)` | Override the subject for a specific method. |
-| `WithAutoAck(bool)` | For JetStream consumers: auto-ack on nil return. Default: true. |
+|---|---|
+| `WithQueueGroup(q)` | One queue group for every method (see the caveat below) |
+| `WithNoQueueGroup()` | No queue groups: every instance receives every message |
+| `WithHandlerInterceptor(i)` | Add a handler interceptor (repeatable) |
+| `WithConsumerConfig(method, cfg)` | JetStream consumer config for one method, by Go method name |
 
----
+## Queue Groups
 
-## Error Handling
+Each handler joins a queue group named after its fully qualified proto method,
+so several instances of a service load-balance that method's messages while
+different methods — and different services — never take each other's traffic.
+This needs no configuration and is almost always what you want.
 
-### Structured Errors
+The name has to be per method rather than a shared constant because NATS groups
+queue subscribers by queue *name* across every subject pattern matching the
+delivered subject, not per subscription subject. That is also why
+`WithQueueGroup` deserves care: it puts every method of the service in one
+group, so if any two of its subjects can match the same message, that message
+reaches only one of them. (Code generation rejects overlapping subjects, so
+this only bites if you also override subjects at runtime.)
 
-Handlers return errors using `protonats.Errorf(code, format, args...)`:
+## Errors
 
-```go
-return nil, protonats.Errorf(404, "order %s not found", req.OrderId)
-```
-
-The generated handler wrapper sets `Nats-Service-Error` and `Nats-Service-Error-Code` headers on the response. The generated client checks these headers and returns a `*protonats.Error`.
+Return `protonats.Errorf(code, format, args...)`. The runtime writes the
+`Nats-Service-Error` and `Nats-Service-Error-Code` headers, and clients turn
+them back into `*protonats.Error`. Plain Go errors become code 500.
 
 ```go
 resp, err := client.GetOrder(ctx, req)
-if err != nil {
-    var pnErr *protonats.Error
-    if errors.As(err, &pnErr) {
-        log.Printf("Service error %d: %s", pnErr.Code, pnErr.Message)
-    }
+var pnErr *protonats.Error
+if errors.As(err, &pnErr) {
+    log.Printf("service error %d: %s", pnErr.Code, pnErr.Message)
 }
 ```
 
-Plain Go errors (not `protonats.Errorf`) are wrapped as code 500 automatically.
+Errors that have no caller to reach — a publish handler failing, a reply that
+cannot be sent — go to the configured logger rather than disappearing.
 
-### JetStream Acker
+## JetStream
 
-For `JETSTREAM_CONSUME` handlers, the `protonats.Acker` interface provides:
+`JETSTREAM_CONSUME` handlers take a `protonats.Acker`:
 
-| Method | Effect |
-|--------|--------|
-| `Ack()` | Acknowledge -- message processed successfully |
-| `Nak()` | Negative ack -- redeliver immediately |
-| `NakWithDelay(d)` | Redeliver after delay |
-| `Term()` | Terminate -- no more redeliveries (dead letter) |
-| `InProgress()` | Extend ack wait (still working on it) |
+```go
+func (h *orderHandler) ProcessOrderEvent(ctx context.Context, msg *orders.OrderEvent, ack protonats.Acker) error {
+    if err := h.index(ctx, msg); err != nil {
+        return err  // NAK'd, redelivered
+    }
+    return nil      // acked
+}
+```
 
-Default behavior based on handler return:
-
-| Handler returns | Auto behavior |
-|----------------|---------------|
+| Return | Effect |
+|---|---|
 | `nil` | `Ack()` |
-| `error` | `Nak()` |
-| `protonats.ErrTerminate` | `Term()` |
+| `protonats.ErrTerminate` | `Term()` — no redelivery |
+| any other error | `Nak()` — redelivered |
 
-Call `ack` methods directly for fine-grained control:
+`Acker` also exposes `Ack`, `Nak`, `NakWithDelay`, `Term`, and `InProgress` for
+direct control. Acking yourself and then returning `nil` is safe — the
+redundant auto-ack is ignored. A payload that fails to deserialize is
+terminated, since it would never decode on redelivery either.
 
-```go
-func (h *handler) ProcessEvent(ctx context.Context, msg *Event, ack protonats.Acker) error {
-    ack.InProgress() // extend timeout
-
-    if err := h.longProcess(ctx, msg); err != nil {
-        ack.NakWithDelay(5 * time.Second)
-        return nil // nil because we handled ack ourselves
-    }
-
-    ack.Ack()
-    return nil
-}
-```
-
----
-
-## KV Store Helpers
-
-For messages with `kv` options:
+Consumers are resolved in this order: a `WithConsumerConfig` override (created
+or updated with exactly that config); an existing durable with the name from
+the proto, bound as-is so operator tuning is never clobbered; otherwise a new
+consumer with explicit-ack defaults, durable if the proto names one.
 
 ```go
-kvStore, err := orders.NewOrderStateKV(pn)
-if err != nil {
-    log.Fatal(err)
-}
+reg, err := orders.RegisterOrderServiceHandler(pn, handler,
+    protonats.WithConsumerConfig("ProcessOrderEvent", jetstream.ConsumerConfig{
+        MaxDeliver:    5,
+        MaxAckPending: 100,
+        AckWait:       30 * time.Second,
+    }),
+)
 ```
 
-The bucket must already exist. Create it with the `nats` CLI, Terraform, or Go setup code:
+## Interceptors
 
-```go
-js := pn.JetStream()
-_, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-    Bucket:  "order-state",
-    History: 10,
-    TTL:     7 * 24 * time.Hour,
-})
-```
-
-### Operations
-
-```go
-// Get
-state, revision, err := kvStore.Get(ctx, "ord_abc123")
-
-// Put (key derived from key_template)
-revision, err := kvStore.Put(ctx, &orders.OrderState{
-    OrderId: "ord_abc123",
-    Status:  orders.ORDER_STATUS_CONFIRMED,
-})
-
-// Create (only if key doesn't exist)
-revision, err := kvStore.Create(ctx, state)
-
-// Update (optimistic concurrency -- fails if revision changed)
-newRev, err := kvStore.Update(ctx, state, revision)
-
-// Delete
-err := kvStore.Delete(ctx, "ord_abc123")
-
-// Watch a single key
-watcher, err := kvStore.Watch(ctx, "ord_abc123")
-defer watcher.Stop()
-for entry := range watcher.Updates() {
-    if entry == nil { continue } // end of initial values
-    log.Printf("Changed: %s → %s", entry.Key, entry.Value.Status)
-}
-
-// Watch all keys
-watcher, err := kvStore.WatchAll(ctx)
-```
-
-The `Watcher[T]` provides:
-- `Updates() <-chan *protonats.KVEntry[T]`
-- `Stop()`
-
-`KVEntry[T]` contains: `Key`, `Value *T`, `Revision uint64`, `Operation` (Put/Delete/Purge), `Created time.Time`.
-
----
-
-## Middleware / Interceptors
-
-### Client Interceptors
-
-```go
-type ClientInterceptor func(
-    ctx context.Context,
-    method string,      // "OrderService.GetOrder"
-    subject string,     // resolved NATS subject
-    req proto.Message,
-    next ClientInvoker,
-) (proto.Message, error)
-```
-
-Example:
+Client interceptors wrap every `Request`, `Publish`, and `PublishJetStream`;
+handler interceptors wrap every handler call, including publish and JetStream
+consume. Both run outermost-first in registration order.
 
 ```go
 func logging(ctx context.Context, method, subject string, req proto.Message, next protonats.ClientInvoker) (proto.Message, error) {
@@ -387,118 +185,26 @@ func logging(ctx context.Context, method, subject string, req proto.Message, nex
 pn, _ := protonats.New(nc, protonats.WithClientInterceptor(logging))
 ```
 
-### Handler Interceptors
+`method` is the fully qualified proto method name — use it as a metrics key,
+since dynamic subjects have unbounded cardinality. An interceptor may
+short-circuit by returning a response without calling `next`; that response is
+copied into the caller's message and must be of the same type.
+
+## Shutdown
 
 ```go
-type HandlerInterceptor func(
-    ctx context.Context,
-    method string,
-    subject string,
-    req proto.Message,
-    next HandlerInvoker,
-) (proto.Message, error)
-```
-
-Add at registration time:
-
-```go
-reg, _ := orders.RegisterOrderServiceHandler(pn, handler,
-    protonats.WithHandlerInterceptor(recoveryInterceptor),
-    protonats.WithHandlerInterceptor(loggingInterceptor),
-)
-```
-
-### Context Values
-
-Handlers can access NATS metadata from context:
-
-```go
-subject := protonats.SubjectFromContext(ctx)    // actual NATS subject
-natsMsg := protonats.MsgFromContext(ctx)         // raw *nats.Msg
-meta := protonats.JetStreamMetaFromContext(ctx)  // JetStream metadata (nil for core NATS)
-```
-
----
-
-## Request-Many Helper
-
-Request-Many (scatter-gather) is not a generated method type, but the runtime library provides a generic helper:
-
-```go
-responses, err := protonats.RequestMany[orders.SearchOrdersResponse](ctx, pn,
-    "orders.search",
-    &orders.SearchOrdersRequest{Query: "widget"},
-    protonats.RequestManyOpts{
-        MaxResponses: 10,
-        Timeout:      2 * time.Second,
-        Stall:        500 * time.Millisecond,
-    },
-)
-```
-
-This is a runtime-only helper -- no proto definition needed. You provide the subject and message directly.
-
----
-
-## Serialization
-
-Default: protobuf binary (`proto.Marshal`/`proto.Unmarshal`). Fast, compact, schema-evolved.
-
-For JSON interop:
-
-```go
-pn, _ := protonats.New(nc, protonats.WithCodec(protonats.JSONCodec))
-```
-
-Custom codecs:
-
-```go
-type Codec interface {
-    Marshal(proto.Message) ([]byte, error)
-    Unmarshal([]byte, proto.Message) error
-    ContentType() string  // "application/protobuf" or "application/json"
-}
-```
-
----
-
-## Graceful Shutdown
-
-```go
-reg1, _ := orders.RegisterOrderServiceHandler(pn, orderHandler)
-reg2, _ := users.RegisterUserServiceHandler(pn, userHandler)
-
-// Wait for signal
 <-ctx.Done()
 
-// Drain handlers (finish in-flight, stop accepting new)
-reg1.Drain()
-reg2.Drain()
-
-// Drain the NATS connection
-nc.Drain()
+reg.Drain()   // stop accepting, let in-flight work finish
+nc.Drain()    // waits for it, then closes
 ```
 
----
+`reg.Drain()` returns as soon as the drain is requested. Draining the
+connection afterwards is what actually waits for in-flight handlers.
 
-## Pattern Decision Guide
+## Not Implemented
 
-```
-Need a response?
-├─ No → Need persistence?
-│        ├─ Yes → JETSTREAM_PUBLISH (proto)
-│        └─ No  → PUBLISH (proto)
-└─ Yes → REQUEST_REPLY (proto, default)
-
-Consuming from a stream?
-└─ Yes → JETSTREAM_CONSUME (proto)
-
-Need scatter-gather?
-└─ Yes → protonats.RequestMany[T]() (runtime helper, no proto)
-
-Need typed KV?
-└─ Yes → kv message option (proto)
-
-Anything else?
-└─ Use pn.NatsConn() or pn.JetStream() directly
-```
+`micro` service discovery and generated `kv` helpers are reserved in
+`options.proto` but not built; the plugin fails if either option is set. For
+scatter-gather, KV, or object store, use `pn.NatsConn()` and `pn.JetStream()`
+directly.

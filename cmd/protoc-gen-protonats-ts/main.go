@@ -10,7 +10,9 @@ func main() {
 	protogen.Options{}.Run(func(plugin *protogen.Plugin) error {
 		for _, file := range plugin.Files {
 			if file.Generate {
-				gents.GenerateFile(plugin, file)
+				if err := gents.GenerateFile(plugin, file); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

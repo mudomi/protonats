@@ -6,8 +6,6 @@ export interface CallOptions {
   timeout?: number;
   /** Additional NATS headers. */
   headers?: MsgHdrs;
-  /** Abort signal for cancellation. */
-  signal?: AbortSignal;
 }
 
 /** Context passed to handler functions. */
@@ -20,6 +18,13 @@ export interface HandlerContext {
 
 /** Options for handler registration. */
 export interface HandlerOptions {
-  /** Queue group for load-balanced subscriptions. */
-  queueGroup?: string;
+  /**
+   * Queue group for every subscription in the registration. Left unset, each
+   * handler joins a group named after its own proto method, so instances of a
+   * service load-balance while distinct methods never take each other's
+   * traffic. Pass null to disable queue groups and have every instance receive
+   * every message. A shared explicit name is only safe when no two of the
+   * service's subjects can match the same message.
+   */
+  queueGroup?: string | null;
 }
