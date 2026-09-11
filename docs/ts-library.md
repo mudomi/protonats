@@ -111,6 +111,12 @@ throwing, an undecodable payload with no reply subject — go to `onError`.
 Both runtimes use binary protobuf, the same subjects derived from the same
 proto files, and the same error headers, so a TypeScript client can call a Go
 handler and vice versa with no configuration. Point them at the same cluster.
+This is covered by a cross-language test (`src/interop.test.ts`) that runs a
+real Go handler against the TypeScript client and back.
+
+The JetStream method types — `JETSTREAM_PUBLISH`, `JETSTREAM_CONSUME`, and
+`JETSTREAM_TASK` — are Go-only. The generator emits a comment where each would
+have gone; use the nats.js JetStream API directly for those.
 
 ## Naming
 

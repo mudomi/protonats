@@ -40,6 +40,18 @@ func MethodSubject(prefix string, m *protogen.Method) string {
 	return prefix + "." + string(m.Desc.Name())
 }
 
+// IsJetStream reports whether a method type is carried by JetStream rather
+// than core NATS, and so requires a stream.
+func IsJetStream(mt protonats.MethodType) bool {
+	switch mt {
+	case protonats.MethodType_JETSTREAM_PUBLISH,
+		protonats.MethodType_JETSTREAM_CONSUME,
+		protonats.MethodType_JETSTREAM_TASK:
+		return true
+	}
+	return false
+}
+
 // MethodStream returns the stream and consumer options for a JetStream method.
 func MethodStream(m *protogen.Method) (stream, consumer string) {
 	if opts := methodOptions(m); opts != nil {
@@ -202,13 +214,18 @@ func ValidateFile(file *protogen.File) error {
 			}
 
 			mt := MethodTypeOf(m)
-			stream, _ := MethodStream(m)
-			isJetStream := mt == protonats.MethodType_JETSTREAM_PUBLISH || mt == protonats.MethodType_JETSTREAM_CONSUME
-			if isJetStream && stream == "" {
+			stream, consumer := MethodStream(m)
+			if IsJetStream(mt) && stream == "" {
 				return fmt.Errorf("%s: %s requires the stream option", m.Desc.FullName(), mt)
 			}
-			if !isJetStream && stream != "" {
-				return fmt.Errorf("%s: the stream option is only valid for JETSTREAM_PUBLISH and JETSTREAM_CONSUME", m.Desc.FullName())
+			if !IsJetStream(mt) && stream != "" {
+				return fmt.Errorf("%s: the stream option is only valid for JetStream methods", m.Desc.FullName())
+			}
+			// A task's rollback must reach exactly one instance of the service
+			// that owns the undo. An ephemeral consumer would give every
+			// instance a copy, so each would undo the same work.
+			if mt == protonats.MethodType_JETSTREAM_TASK && consumer == "" {
+				return fmt.Errorf("%s: JETSTREAM_TASK requires the consumer option, so its rollback is delivered once", m.Desc.FullName())
 			}
 
 			if _, err := TokenFields(m, MethodSubject(prefix, m)); err != nil {

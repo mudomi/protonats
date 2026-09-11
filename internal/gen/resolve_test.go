@@ -233,26 +233,71 @@ func TestValidateFile_AllowsDistinctSubjects(t *testing.T) {
 	}
 }
 
-// A service whose only method is a JetStream publish registers nothing, so the
-// generated Register function must still compile — it has no use for its
-// resolved options and Go rejects an unused variable.
-func TestGenerateFile_ServiceWithNoSubscriptions(t *testing.T) {
-	plugin, file := buildPluginAndFile(t, nil, &protonats.MethodOptions{
+// A service whose only method is a JetStream publish has no handler side at
+// all, so it gets a client and nothing else — an empty interface and a
+// registration that subscribes to nothing would only be noise.
+func TestGenerateFile_ClientOnlyService(t *testing.T) {
+	got := generateSynth(t, &protonats.MethodOptions{
 		Type:   protonats.MethodType_JETSTREAM_PUBLISH,
 		Stream: "EVENTS",
-	}, false, nil)
+	})
 
+	if !strings.Contains(got, "func NewSvcClient(") {
+		t.Errorf("the client is still required; got:\n%s", got)
+	}
+	for _, absent := range []string{"type SvcHandler interface", "func RegisterSvcHandler(", "pn.Subscribe("} {
+		if strings.Contains(got, absent) {
+			t.Errorf("a publish-only service must not generate %q; got:\n%s", absent, got)
+		}
+	}
+}
+
+// A task generates three roles from one declaration: the client that triggers
+// it, the worker that runs it, and the rollback that undoes it. The rollback's
+// subject and consumer are derived, which is what keeps the two halves in step.
+func TestGenerateFile_TaskGeneratesBothRoles(t *testing.T) {
+	got := generateSynth(t, &protonats.MethodOptions{
+		Type:     protonats.MethodType_JETSTREAM_TASK,
+		Stream:   "EVENTS",
+		Consumer: "doer",
+	})
+
+	for _, want := range []string{
+		"func (c *SvcClient) Do(",       // trigger
+		"type SvcWorker interface",      // performs the work
+		"func RegisterSvcWorker(",       //
+		"pn.ConsumeTask(",               //
+		"type SvcRollback interface",    // undoes it
+		"func RegisterSvcRollback(",     //
+		"pn.ConsumeRollback(",           //
+		`Subject:  "synth.Do.rollback"`, // derived, not configured
+		`Consumer: "doer-rollback"`,     // derived, not configured
+		"cause *protonats.Error",        // the rollback is told why
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated output missing %q; got:\n%s", want, got)
+		}
+	}
+
+	// The task must not also appear in the plain handler surface.
+	if strings.Contains(got, "type SvcHandler interface") {
+		t.Errorf("a task-only service must not generate a plain handler; got:\n%s", got)
+	}
+}
+
+// generateSynth builds a one-method service with the given options and returns
+// the generated Go source.
+func generateSynth(t *testing.T, opts *protonats.MethodOptions) string {
+	t.Helper()
+	plugin, file := buildPluginAndFile(t, nil, opts, false, nil)
 	if err := GenerateFile(plugin, file); err != nil {
 		t.Fatal(err)
 	}
-	got := plugin.Response().File[0].GetContent()
-
-	if !strings.Contains(got, "_ = ho") {
-		t.Errorf("Register must discard its unused options; got:\n%s", got)
+	resp := plugin.Response()
+	if resp.Error != nil {
+		t.Fatalf("plugin error: %s", resp.GetError())
 	}
-	if strings.Contains(got, "pn.Subscribe(") {
-		t.Errorf("a JetStream-publish-only service must not subscribe; got:\n%s", got)
-	}
+	return resp.File[0].GetContent()
 }
 
 // ── Invalid option combinations, built as synthetic descriptors ──
@@ -373,7 +418,23 @@ func TestValidateFile_Rejections(t *testing.T) {
 		{
 			name:    "stream invalid on request/reply",
 			method:  &protonats.MethodOptions{Stream: "S"},
-			wantErr: "only valid for JETSTREAM_PUBLISH",
+			wantErr: "only valid for JetStream methods",
+		},
+		{
+			name:    "task requires stream",
+			method:  &protonats.MethodOptions{Type: protonats.MethodType_JETSTREAM_TASK, Consumer: "c"},
+			wantErr: "requires the stream option",
+		},
+		{
+			// An ephemeral consumer would hand every instance a copy of the
+			// rollback, so each would undo the same work.
+			name:    "task requires consumer",
+			method:  &protonats.MethodOptions{Type: protonats.MethodType_JETSTREAM_TASK, Stream: "S"},
+			wantErr: "requires the consumer option",
+		},
+		{
+			name:   "valid task",
+			method: &protonats.MethodOptions{Type: protonats.MethodType_JETSTREAM_TASK, Stream: "S", Consumer: "c"},
 		},
 		{
 			name:    "unknown token field",

@@ -1,0 +1,28 @@
+syntax = "proto3";
+package shop;
+
+option go_package = "github.com/mudomi/protonats/examples/rollback/gen;shopgen";
+
+import "google/protobuf/empty.proto";
+import "protonats/options.proto";
+
+// Payments charges cards on behalf of the order service.
+//
+// ChargeCard is declared once as a task and generated as two roles: a worker
+// that charges the card, and a rollback that refunds it when the charge is
+// given up on. Neither half names a subject or a consumer — both are derived
+// from this one declaration, so they cannot drift apart.
+service Payments {
+  rpc ChargeCard(Charge) returns (google.protobuf.Empty) {
+    option (protonats.method) = {
+      type: JETSTREAM_TASK
+      stream: "SHOP"
+      consumer: "payments"
+    };
+  }
+}
+
+message Charge {
+  string order_id = 1;
+  int64 amount_cents = 2;
+}

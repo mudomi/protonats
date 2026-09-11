@@ -1,10 +1,12 @@
 package protonats
 
 import (
+	"context"
 	"sync"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/proto"
 )
 
 // Registration holds the active subscriptions and JetStream consumers for a
@@ -75,7 +77,18 @@ type HandlerOptions struct {
 	queueGroup      *string
 	interceptors    []HandlerInterceptor
 	consumerConfigs map[string]jetstream.ConsumerConfig
+	retryPolicy     RetryPolicy
+	onTerminate     TerminalFunc
 }
+
+// TerminalFunc is notified when a JetStream message is given up on, whether by
+// the retry policy or by exhausting the consumer's MaxDeliver. It runs before
+// the message is terminated, and before any rollback is published.
+//
+// It is for observability — metrics, alerting, a dead-letter record. Returning
+// is the only option: an error here cannot change the outcome, because the
+// message has already failed every attempt it was given.
+type TerminalFunc func(ctx context.Context, method, subject string, req proto.Message, cause error)
 
 // queueGroupOr returns the configured queue group, or def when unset.
 func (ho HandlerOptions) queueGroupOr(def string) string {
@@ -117,6 +130,18 @@ func WithNoQueueGroup() HandlerOption {
 // WithHandlerInterceptor adds a handler interceptor.
 func WithHandlerInterceptor(i HandlerInterceptor) HandlerOption {
 	return func(o *HandlerOptions) { o.interceptors = append(o.interceptors, i) }
+}
+
+// WithRetryPolicy sets how handler errors on JetStream consume and task
+// methods are classified. The default retries everything but ErrTerminate;
+// TerminateOnClientError also gives up on 4xx errors.
+func WithRetryPolicy(p RetryPolicy) HandlerOption {
+	return func(o *HandlerOptions) { o.retryPolicy = p }
+}
+
+// WithOnTerminate registers a callback for messages that are given up on.
+func WithOnTerminate(fn TerminalFunc) HandlerOption {
+	return func(o *HandlerOptions) { o.onTerminate = fn }
 }
 
 // WithConsumerConfig overrides the JetStream consumer configuration for one

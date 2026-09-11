@@ -49,6 +49,14 @@ enum MethodType {
   PUBLISH = 1;
   JETSTREAM_PUBLISH = 2;
   JETSTREAM_CONSUME = 3;
+
+  // A unit of work with a paired rollback, declared once and generated as two
+  // roles: a worker that runs it, and a rollback that undoes it when the work
+  // fails for good. The rollback subject and consumer are derived, so both
+  // roles are guaranteed to agree on subject and message type.
+  //
+  // Requires the stream and consumer options.
+  JETSTREAM_TASK = 4;
 }
 
 // Field-level options.

@@ -36,6 +36,15 @@ service TestService {
       consumer: "event-processor"
     };
   }
+
+  // Task with a paired rollback (worker + rollback halves)
+  rpc ChargeCard(ChargeRequest) returns (google.protobuf.Empty) {
+    option (protonats.method) = {
+      type: JETSTREAM_TASK
+      stream: "EVENTS"
+      consumer: "card-charger"
+    };
+  }
 }
 
 // Service with custom subject prefix
@@ -71,6 +80,11 @@ message NotifyRequest {
 message EventPayload {
   string event_id = 1;
   string data = 2;
+}
+
+message ChargeRequest {
+  string charge_id = 1;
+  int64 amount_cents = 2;
 }
 
 message PingRequest {}

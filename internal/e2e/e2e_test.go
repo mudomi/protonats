@@ -6,6 +6,7 @@ package e2e
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,8 +48,10 @@ func freshEventsStream(t *testing.T, pn *protonats.Conn) jetstream.JetStream {
 
 	_ = js.DeleteStream(ctx, "EVENTS")
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
-		Name:     "EVENTS",
-		Subjects: []string{"testpkg.EmitEvent", "testpkg.ProcessEvent"},
+		Name: "EVENTS",
+		// ChargeCard's rollback subject is derived, so the stream has to
+		// capture it too — hence the wildcard rather than a literal.
+		Subjects: []string{"testpkg.EmitEvent", "testpkg.ProcessEvent", "testpkg.ChargeCard", "testpkg.ChargeCard.>"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -573,6 +576,260 @@ func TestJetStreamConsume_BindsExistingDurable(t *testing.T) {
 // TestRegistrationRollback verifies that when a later registration step fails
 // (here: the JetStream consumer, because the stream does not exist), the
 // already-created core subscriptions are torn down again.
+// ── Tasks and rollbacks ──
+
+// taskHandler implements both halves of the ChargeCard task, recording what
+// each one saw.
+type taskHandler struct {
+	work     func(context.Context, *testgen.ChargeRequest) error
+	rolled   chan *testgen.ChargeRequest
+	causes   chan *protonats.Error
+	attempts atomic.Int32
+}
+
+func newTaskHandler(work func(context.Context, *testgen.ChargeRequest) error) *taskHandler {
+	return &taskHandler{
+		work:   work,
+		rolled: make(chan *testgen.ChargeRequest, 4),
+		causes: make(chan *protonats.Error, 4),
+	}
+}
+
+func (h *taskHandler) ChargeCard(ctx context.Context, req *testgen.ChargeRequest, _ protonats.Acker) error {
+	h.attempts.Add(1)
+	return h.work(ctx, req)
+}
+
+// The rollback half satisfies TestServiceRollback via a separate receiver so
+// one struct can register as both roles in a test.
+type rollbackHandler struct{ h *taskHandler }
+
+func (r rollbackHandler) ChargeCard(_ context.Context, req *testgen.ChargeRequest, cause *protonats.Error, _ protonats.Acker) error {
+	r.h.rolled <- req
+	r.h.causes <- cause
+	return nil
+}
+
+// registerTask wires both halves against one connection. Real deployments split
+// them across services; one process is enough to prove the wire contract.
+func registerTask(t *testing.T, pn *protonats.Conn, h *taskHandler, opts ...protonats.HandlerOption) {
+	t.Helper()
+	worker, err := testgen.RegisterTestServiceWorker(pn, h, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = worker.Unsubscribe() })
+
+	rollback, err := testgen.RegisterTestServiceRollback(pn, rollbackHandler{h})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rollback.Unsubscribe() })
+}
+
+func TestTask_SucceedsWithoutRollback(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	done := make(chan string, 1)
+	h := newTaskHandler(func(_ context.Context, req *testgen.ChargeRequest) error {
+		done <- req.ChargeId
+		return nil
+	})
+	registerTask(t, pn, h)
+
+	client := testgen.NewTestServiceClient(pn)
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "ok-1", AmountCents: 500})
+	require.NoError(t, err)
+
+	select {
+	case id := <-done:
+		assert.Equal(t, "ok-1", id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("task never ran")
+	}
+
+	// Work that succeeded must not be undone.
+	select {
+	case req := <-h.rolled:
+		t.Fatalf("a successful task was rolled back: %+v", req)
+	case <-time.After(time.Second):
+	}
+}
+
+// ErrTerminate says the work will never succeed, so the rollback runs at once
+// rather than after a round of pointless retries.
+func TestTask_TerminalErrorRollsBackImmediately(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	h := newTaskHandler(func(_ context.Context, _ *testgen.ChargeRequest) error {
+		return fmt.Errorf("card declined: %w", protonats.ErrTerminate)
+	})
+	registerTask(t, pn, h)
+
+	client := testgen.NewTestServiceClient(pn)
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "declined-1", AmountCents: 900})
+	require.NoError(t, err)
+
+	select {
+	case req := <-h.rolled:
+		assert.Equal(t, "declined-1", req.ChargeId, "the rollback receives the message that failed")
+		assert.EqualValues(t, 900, req.AmountCents)
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback never ran")
+	}
+	assert.EqualValues(t, 1, h.attempts.Load(), "a terminal error must not be retried first")
+}
+
+// The cause travels with the rollback, so the handler can tell a declined card
+// from a crashed dependency.
+func TestTask_RollbackReceivesCause(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	h := newTaskHandler(func(_ context.Context, _ *testgen.ChargeRequest) error {
+		return protonats.Errorf(402, "insufficient funds")
+	})
+	registerTask(t, pn, h, protonats.WithRetryPolicy(protonats.TerminateOnClientError))
+
+	client := testgen.NewTestServiceClient(pn)
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "broke-1"})
+	require.NoError(t, err)
+
+	select {
+	case cause := <-h.causes:
+		require.NotNil(t, cause)
+		assert.Equal(t, 402, cause.Code)
+		assert.Equal(t, "insufficient funds", cause.Message)
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback never ran")
+	}
+}
+
+// A 4xx is the request's fault and will fail identically every time, so
+// TerminateOnClientError gives up on the first attempt.
+func TestTask_ClientErrorPolicySkipsRetries(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	h := newTaskHandler(func(_ context.Context, _ *testgen.ChargeRequest) error {
+		return protonats.Errorf(400, "malformed charge")
+	})
+	registerTask(t, pn, h, protonats.WithRetryPolicy(protonats.TerminateOnClientError))
+
+	client := testgen.NewTestServiceClient(pn)
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "bad-1"})
+	require.NoError(t, err)
+
+	select {
+	case <-h.rolled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback never ran")
+	}
+	assert.EqualValues(t, 1, h.attempts.Load())
+}
+
+// The important case: a handler that keeps failing for an ordinary reason.
+// JetStream would silently drop the message once MaxDeliver ran out, so the
+// runtime treats the final attempt as terminal and rolls back instead.
+func TestTask_RollsBackAfterRetriesAreExhausted(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	h := newTaskHandler(func(_ context.Context, _ *testgen.ChargeRequest) error {
+		return fmt.Errorf("payment gateway timeout")
+	})
+	registerTask(t, pn, h, protonats.WithConsumerConfig("ChargeCard", jetstream.ConsumerConfig{
+		Durable:    "card-charger",
+		MaxDeliver: 3,
+		BackOff:    []time.Duration{200 * time.Millisecond, 200 * time.Millisecond},
+	}))
+
+	client := testgen.NewTestServiceClient(pn)
+	started := time.Now()
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "flaky-1"})
+	require.NoError(t, err)
+
+	select {
+	case req := <-h.rolled:
+		assert.Equal(t, "flaky-1", req.ChargeId)
+	case <-time.After(15 * time.Second):
+		t.Fatal("rollback never ran after retries were exhausted")
+	}
+	assert.EqualValues(t, 3, h.attempts.Load(), "every delivery MaxDeliver allows should be tried before giving up")
+
+	// Two retries at 200ms each. A plain Nak asks for redelivery immediately,
+	// so without the backoff being applied the whole thing finishes in
+	// milliseconds and a failing dependency gets hammered.
+	assert.GreaterOrEqual(t, time.Since(started), 400*time.Millisecond,
+		"retries must be spaced by the consumer's configured BackOff")
+}
+
+// A transient failure that later succeeds must not roll back: the retry is the
+// whole point of not giving up early.
+func TestTask_RecoveryBeforeExhaustionSkipsRollback(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	var h *taskHandler
+	h = newTaskHandler(func(_ context.Context, _ *testgen.ChargeRequest) error {
+		if h.attempts.Load() == 1 {
+			return fmt.Errorf("transient blip")
+		}
+		return nil
+	})
+	registerTask(t, pn, h, protonats.WithConsumerConfig("ChargeCard", jetstream.ConsumerConfig{
+		Durable:    "card-charger",
+		MaxDeliver: 3,
+		BackOff:    []time.Duration{200 * time.Millisecond, 200 * time.Millisecond},
+	}))
+
+	client := testgen.NewTestServiceClient(pn)
+	_, err := client.ChargeCard(context.Background(), &testgen.ChargeRequest{ChargeId: "blip-1"})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return h.attempts.Load() >= 2 }, 10*time.Second, 50*time.Millisecond)
+
+	select {
+	case req := <-h.rolled:
+		t.Fatalf("a task that recovered was rolled back: %+v", req)
+	case <-time.After(time.Second):
+	}
+}
+
+// WithOnTerminate is the observability hook: it fires for anything given up on,
+// including a plain consume method that has no rollback at all.
+func TestOnTerminate_FiresForConsumeWithoutRollback(t *testing.T) {
+	pn := connect(t)
+	freshEventsStream(t, pn)
+
+	type terminal struct {
+		method string
+		cause  error
+	}
+	seen := make(chan terminal, 1)
+
+	register(t, pn, &handler{
+		process: func(_ context.Context, _ *testgen.EventPayload, _ protonats.Acker) error {
+			return protonats.ErrTerminate
+		},
+	}, protonats.WithOnTerminate(func(_ context.Context, method, _ string, _ proto.Message, cause error) {
+		select {
+		case seen <- terminal{method, cause}:
+		default:
+		}
+	}))
+
+	_, err := pn.PublishJetStream(context.Background(), "testpkg.ProcessEvent",
+		&testgen.EventPayload{EventId: "term-hook"})
+	require.NoError(t, err)
+
+	select {
+	case got := <-seen:
+		assert.Equal(t, "testpkg.TestService.ProcessEvent", got.method)
+		assert.ErrorIs(t, got.cause, protonats.ErrTerminate)
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal hook never fired")
+	}
+}
+
 func TestRegistrationRollback(t *testing.T) {
 	pn := connect(t)
 	js, err := pn.JetStream()

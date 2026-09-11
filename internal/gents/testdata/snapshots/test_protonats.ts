@@ -24,6 +24,9 @@ export class TestServiceClient {
   // EmitEvent (JETSTREAM_PUBLISH) is not generated: the TS runtime
   // does not support JetStream; use the nats.js JetStream API directly.
 
+  // ChargeCard (JETSTREAM_TASK) is not generated: the TS runtime
+  // does not support JetStream; use the nats.js JetStream API directly.
+
 }
 
 export interface TestServiceHandler {
@@ -31,6 +34,9 @@ export interface TestServiceHandler {
   getItem(ctx: HandlerContext, req: GetItemRequest): Promise<Item>;
   notify(ctx: HandlerContext, req: NotifyRequest): Promise<void>;
   // ProcessEvent (JETSTREAM_CONSUME) is not generated: the TS runtime
+  // does not support JetStream; use the nats.js JetStream API directly.
+
+  // ChargeCard (JETSTREAM_TASK) is not generated: the TS runtime
   // does not support JetStream; use the nats.js JetStream API directly.
 
 }

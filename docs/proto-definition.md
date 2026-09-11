@@ -111,6 +111,7 @@ Set with `option (protonats.method) = { ... };` inside an `rpc`.
 | `PUBLISH` | Fire-and-forget. Use `google.protobuf.Empty` as the response type. |
 | `JETSTREAM_PUBLISH` | Publish to a stream and wait for the ack. Requires `stream`. |
 | `JETSTREAM_CONSUME` | Consume from a stream. Handler-only. Requires `stream`. |
+| `JETSTREAM_TASK` | Work with a paired rollback. Requires `stream` and `consumer`. |
 
 ```protobuf
 rpc OrderCreated(OrderCreatedEvent) returns (google.protobuf.Empty) {
@@ -129,6 +130,42 @@ rpc ProcessOrderEvent(OrderEvent) returns (google.protobuf.Empty) {
 A `PUBLISH` handler's error return is for logging and metrics only — there is no
 reply subject to send it to.
 
+### Tasks
+
+`JETSTREAM_TASK` declares a unit of work together with its undo. One rpc
+generates three roles:
+
+```protobuf
+rpc ChargeCard(Charge) returns (google.protobuf.Empty) {
+  option (protonats.method) = {
+    type: JETSTREAM_TASK
+    stream: "SHOP"
+    consumer: "payments"
+  };
+}
+```
+
+| Role | Generated | Implemented by |
+|---|---|---|
+| Trigger | `PaymentsClient.ChargeCard` | whoever starts the work |
+| Worker | `PaymentsWorker` + `RegisterPaymentsWorker` | the service that does it |
+| Rollback | `PaymentsRollback` + `RegisterPaymentsRollback` | the service that undoes it |
+
+The rollback's subject and durable consumer are **derived**, never configured:
+`shop.ChargeCard` gets `shop.ChargeCard.rollback` and `payments-rollback`. That
+is the point of declaring both halves in one rpc — they share a message type
+and cannot disagree about where to find each other.
+
+The stream must capture the rollback subject as well as the task subject, so
+give it a subtree (`shop.>`) rather than a list of literals. protonats creates
+consumers but never streams.
+
+`consumer` is required: an ephemeral consumer would hand every running instance
+its own copy of the rollback, and each would undo the same work.
+
+See the [Go Library Guide](go-library.md) for when a rollback fires, and
+[`examples/rollback`](../examples/rollback) for a runnable walkthrough.
+
 ### `subject`
 
 Overrides the subject, with `{field}` interpolation as described above.
@@ -138,6 +175,7 @@ Overrides the subject, with `{field}` interpolation as described above.
 `stream` is required for both JetStream types and rejected on the others.
 `consumer` names the durable consumer for `JETSTREAM_CONSUME`; if omitted, an
 ephemeral consumer is created, which is rarely what you want in production.
+`JETSTREAM_TASK` requires both.
 All other consumer tuning happens at registration time — see the
 [Go Library Guide](go-library.md).
 

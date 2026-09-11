@@ -36,12 +36,43 @@ func GenerateFile(plugin *protogen.Plugin, file *protogen.File) error {
 
 	for _, svc := range file.Services {
 		prefix := SubjectPrefix(file, svc)
+		tasks, plain := partitionMethods(svc)
+
 		generateClient(g, svc, prefix)
-		generateHandlerInterface(g, svc)
-		generateUnimplemented(g, svc)
-		generateRegister(g, svc, prefix)
+
+		// A service with nothing but tasks has no plain handler to implement;
+		// emitting an empty interface and a registration that subscribes to
+		// nothing would just be noise.
+		if len(plain) > 0 {
+			generateHandlerInterface(g, svc)
+			generateUnimplemented(g, svc)
+			generateRegister(g, svc, prefix)
+		}
+
+		// A task declares both halves at once, but they are implemented by
+		// different services, so each half gets its own interface and its own
+		// registration function.
+		if len(tasks) > 0 {
+			generateWorker(g, svc, prefix, tasks)
+			generateRollback(g, svc, prefix, tasks)
+		}
 	}
 	return nil
+}
+
+// partitionMethods splits a service's methods into its tasks and everything
+// that has a plain handler, preserving declaration order in both.
+func partitionMethods(svc *protogen.Service) (tasks, plain []*protogen.Method) {
+	for _, m := range svc.Methods {
+		switch MethodTypeOf(m) {
+		case protonats.MethodType_JETSTREAM_TASK:
+			tasks = append(tasks, m)
+		case protonats.MethodType_REQUEST_REPLY, protonats.MethodType_PUBLISH, protonats.MethodType_JETSTREAM_CONSUME:
+			plain = append(plain, m)
+		}
+		// JETSTREAM_PUBLISH is client-only: no handler either way.
+	}
+	return tasks, plain
 }
 
 // ── Identifiers ──
@@ -125,7 +156,9 @@ func generateClient(g *protogen.GeneratedFile, svc *protogen.Service, prefix str
 			g.P("}")
 			g.P()
 
-		case protonats.MethodType_JETSTREAM_PUBLISH:
+		// A task is triggered exactly like a JetStream publish; the rollback is
+		// the runtime's business, not the caller's.
+		case protonats.MethodType_JETSTREAM_PUBLISH, protonats.MethodType_JETSTREAM_TASK:
 			pubAck := ident(g, jetstreamPackage, "PubAck")
 			g.P("func (c *", name, "Client) ", m.GoName, "(ctx ", ctxType(g), ", req *", in, ", opts ...", callOpt, ") (*", pubAck, ", error) {")
 			// Full slice expression: appending to the caller's slice in place would
@@ -191,6 +224,125 @@ func generateUnimplemented(g *protogen.GeneratedFile, svc *protogen.Service) {
 		}
 		g.P()
 	}
+}
+
+// ── Task: worker half ──
+
+// generateWorker emits the interface and registration for the service that
+// performs the work. When a task is given up on, the runtime publishes the
+// rollback; nothing here has to.
+func generateWorker(g *protogen.GeneratedFile, svc *protogen.Service, prefix string, tasks []*protogen.Method) {
+	name := svc.GoName + "Worker"
+	ctx := ctxType(g)
+	acker := pnIdent(g, "Acker")
+
+	g.P("// ", name, " performs this service's task methods. A handler that returns")
+	g.P("// an error the retry policy gives up on has its task rolled back.")
+	g.P("type ", name, " interface {")
+	for _, m := range tasks {
+		g.P("    ", m.GoName, "(ctx ", ctx, ", req *", g.QualifiedGoIdent(m.Input.GoIdent), ", ack ", acker, ") error")
+	}
+	g.P("}")
+	g.P()
+
+	generateTaskRegister(g, svc, prefix, tasks, taskRole{
+		funcName: "Register" + svc.GoName + "Worker",
+		iface:    name,
+	})
+}
+
+// ── Task: rollback half ──
+
+// generateRollback emits the interface and registration for the service that
+// undoes the work. It receives the message that failed and the error that
+// ended it.
+func generateRollback(g *protogen.GeneratedFile, svc *protogen.Service, prefix string, tasks []*protogen.Method) {
+	name := svc.GoName + "Rollback"
+	ctx := ctxType(g)
+	acker := pnIdent(g, "Acker")
+	pnErr := pnIdent(g, "Error")
+
+	g.P("// ", name, " undoes this service's task methods after they are given up")
+	g.P("// on. Rollbacks are delivered at least once, so they must be idempotent.")
+	g.P("type ", name, " interface {")
+	for _, m := range tasks {
+		g.P("    ", m.GoName, "(ctx ", ctx, ", req *", g.QualifiedGoIdent(m.Input.GoIdent), ", cause *", pnErr, ", ack ", acker, ") error")
+	}
+	g.P("}")
+	g.P()
+
+	generateTaskRegister(g, svc, prefix, tasks, taskRole{
+		funcName:   "Register" + svc.GoName + "Rollback",
+		iface:      name,
+		isRollback: true,
+	})
+}
+
+// taskRole names the half of a task being generated. Everything about the two
+// registrations is identical apart from the subject and consumer they bind and
+// the extra cause argument the rollback handler takes.
+type taskRole struct {
+	funcName   string
+	iface      string
+	isRollback bool
+}
+
+func generateTaskRegister(g *protogen.GeneratedFile, svc *protogen.Service, prefix string, tasks []*protogen.Method, role taskRole) {
+	conn := pnIdent(g, "Conn")
+	reg := pnIdent(g, "Registration")
+	handlerOpt := pnIdent(g, "HandlerOption")
+	applyOpts := pnIdent(g, "ApplyHandlerOptions")
+	consumeCfg := pnIdent(g, "ConsumeConfig")
+	acker := pnIdent(g, "Acker")
+	pm := protoMsg(g)
+	ctx := ctxType(g)
+
+	consume, handlerArgs := "ConsumeTask", "ctx, req.(*%s), ack"
+	handlerSig := "func(ctx " + ctx + ", req " + pm + ", ack " + acker + ") error {"
+	if role.isRollback {
+		pnErr := pnIdent(g, "Error")
+		consume, handlerArgs = "ConsumeRollback", "ctx, req.(*%s), cause, ack"
+		handlerSig = "func(ctx " + ctx + ", req " + pm + ", cause *" + pnErr + ", ack " + acker + ") error {"
+	}
+
+	g.P("func ", role.funcName, "(pn *", conn, ", handler ", role.iface, ", opts ...", handlerOpt, ") (*", reg, ", error) {")
+	g.P("    ho := ", applyOpts, "(opts)")
+	g.P("    reg := &", reg, "{}")
+	g.P()
+
+	for _, m := range tasks {
+		subject := SubscribeSubject(MethodSubject(prefix, m))
+		stream, consumer := MethodStream(m)
+		if role.isRollback {
+			subject = protonats.RollbackSubjectFor(subject)
+			consumer = protonats.RollbackConsumerFor(consumer)
+		}
+		in := g.QualifiedGoIdent(m.Input.GoIdent)
+
+		g.P("    {")
+		g.P("        cc, err := pn.", consume, "(", consumeCfg, "{")
+		g.P("            Method:   ", fmt.Sprintf("%q", methodName(m)), ",")
+		g.P("            Subject:  ", fmt.Sprintf("%q", subject), ",")
+		g.P("            Stream:   ", fmt.Sprintf("%q", stream), ",")
+		g.P("            Consumer: ", fmt.Sprintf("%q", consumer), ",")
+		g.P("        }, ho,")
+		g.P("            func() ", pm, " { return new(", in, ") },")
+		g.P("            ", handlerSig)
+		g.P("                return handler.", m.GoName, "(", fmt.Sprintf(handlerArgs, in), ")")
+		g.P("            },")
+		g.P("        )")
+		g.P("        if err != nil {")
+		g.P("            _ = reg.Unsubscribe()")
+		g.P("            return nil, err")
+		g.P("        }")
+		g.P("        reg.AddConsumeContext(cc)")
+		g.P("    }")
+		g.P()
+	}
+
+	g.P("    return reg, nil")
+	g.P("}")
+	g.P()
 }
 
 // ── Register ──

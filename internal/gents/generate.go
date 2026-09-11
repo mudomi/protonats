@@ -115,7 +115,7 @@ func generateClient(g *protogen.GeneratedFile, svc *protogen.Service, prefix str
 			g.P("  }")
 			g.P()
 
-		case protonats.MethodType_JETSTREAM_PUBLISH:
+		case protonats.MethodType_JETSTREAM_PUBLISH, protonats.MethodType_JETSTREAM_TASK:
 			jetStreamNotice(g, m)
 
 		case protonats.MethodType_JETSTREAM_CONSUME:
@@ -143,7 +143,7 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc *protogen.Service) 
 			g.P("  ", tsMethod, "(ctx: HandlerContext, req: ", inName, "): Promise<", outName, ">;")
 		case protonats.MethodType_PUBLISH:
 			g.P("  ", tsMethod, "(ctx: HandlerContext, req: ", inName, "): Promise<void>;")
-		case protonats.MethodType_JETSTREAM_CONSUME:
+		case protonats.MethodType_JETSTREAM_CONSUME, protonats.MethodType_JETSTREAM_TASK:
 			jetStreamNotice(g, m)
 		}
 	}

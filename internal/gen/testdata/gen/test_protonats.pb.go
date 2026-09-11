@@ -47,6 +47,11 @@ func (c *TestServiceClient) EmitEvent(ctx context.Context, req *EventPayload, op
 	return c.pn.PublishJetStream(ctx, "testpkg.EmitEvent", req, opts...)
 }
 
+func (c *TestServiceClient) ChargeCard(ctx context.Context, req *ChargeRequest, opts ...protonats.CallOption) (*jetstream.PubAck, error) {
+	opts = append(opts[:len(opts):len(opts)], protonats.WithMethodName("testpkg.TestService.ChargeCard"))
+	return c.pn.PublishJetStream(ctx, "testpkg.ChargeCard", req, opts...)
+}
+
 type TestServiceHandler interface {
 	Echo(ctx context.Context, req *EchoRequest) (*EchoResponse, error)
 	GetItem(ctx context.Context, req *GetItemRequest) (*Item, error)
@@ -128,6 +133,70 @@ func RegisterTestServiceHandler(pn *protonats.Conn, handler TestServiceHandler, 
 			func() proto.Message { return new(EventPayload) },
 			func(ctx context.Context, req proto.Message, ack protonats.Acker) error {
 				return handler.ProcessEvent(ctx, req.(*EventPayload), ack)
+			},
+		)
+		if err != nil {
+			_ = reg.Unsubscribe()
+			return nil, err
+		}
+		reg.AddConsumeContext(cc)
+	}
+
+	return reg, nil
+}
+
+// TestServiceWorker performs this service's task methods. A handler that returns
+// an error the retry policy gives up on has its task rolled back.
+type TestServiceWorker interface {
+	ChargeCard(ctx context.Context, req *ChargeRequest, ack protonats.Acker) error
+}
+
+func RegisterTestServiceWorker(pn *protonats.Conn, handler TestServiceWorker, opts ...protonats.HandlerOption) (*protonats.Registration, error) {
+	ho := protonats.ApplyHandlerOptions(opts)
+	reg := &protonats.Registration{}
+
+	{
+		cc, err := pn.ConsumeTask(protonats.ConsumeConfig{
+			Method:   "testpkg.TestService.ChargeCard",
+			Subject:  "testpkg.ChargeCard",
+			Stream:   "EVENTS",
+			Consumer: "card-charger",
+		}, ho,
+			func() proto.Message { return new(ChargeRequest) },
+			func(ctx context.Context, req proto.Message, ack protonats.Acker) error {
+				return handler.ChargeCard(ctx, req.(*ChargeRequest), ack)
+			},
+		)
+		if err != nil {
+			_ = reg.Unsubscribe()
+			return nil, err
+		}
+		reg.AddConsumeContext(cc)
+	}
+
+	return reg, nil
+}
+
+// TestServiceRollback undoes this service's task methods after they are given up
+// on. Rollbacks are delivered at least once, so they must be idempotent.
+type TestServiceRollback interface {
+	ChargeCard(ctx context.Context, req *ChargeRequest, cause *protonats.Error, ack protonats.Acker) error
+}
+
+func RegisterTestServiceRollback(pn *protonats.Conn, handler TestServiceRollback, opts ...protonats.HandlerOption) (*protonats.Registration, error) {
+	ho := protonats.ApplyHandlerOptions(opts)
+	reg := &protonats.Registration{}
+
+	{
+		cc, err := pn.ConsumeRollback(protonats.ConsumeConfig{
+			Method:   "testpkg.TestService.ChargeCard",
+			Subject:  "testpkg.ChargeCard.rollback",
+			Stream:   "EVENTS",
+			Consumer: "card-charger-rollback",
+		}, ho,
+			func() proto.Message { return new(ChargeRequest) },
+			func(ctx context.Context, req proto.Message, cause *protonats.Error, ack protonats.Acker) error {
+				return handler.ChargeCard(ctx, req.(*ChargeRequest), cause, ack)
 			},
 		)
 		if err != nil {

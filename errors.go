@@ -11,6 +11,12 @@ import (
 const (
 	headerError     = "Nats-Service-Error"
 	headerErrorCode = "Nats-Service-Error-Code"
+
+	// Rollback messages reuse the two headers above for the cause, so an error
+	// has one representation on the wire regardless of which path carried it.
+	// These two add the provenance a rollback handler cannot infer.
+	headerRollbackOf       = "Protonats-Rollback-Of"
+	headerRollbackAttempts = "Protonats-Rollback-Attempts"
 )
 
 // Error is a structured error with a numeric code, compatible with the NATS Service API.
@@ -62,4 +68,15 @@ func errorFromHeaders(h nats.Header) error {
 		}
 	}
 	return &Error{Code: code, Message: msg}
+}
+
+// causeFromHeaders reads the error a rollback message carries. It returns the
+// concrete type rather than an error interface, so a rollback handler can test
+// the code without unwrapping — and so an absent cause is a plain nil.
+func causeFromHeaders(h nats.Header) *Error {
+	var pnErr *Error
+	if errors.As(errorFromHeaders(h), &pnErr) {
+		return pnErr
+	}
+	return nil
 }

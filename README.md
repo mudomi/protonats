@@ -85,8 +85,33 @@ pn, _ := protonats.New(nc)
 | **Publish** | `type: PUBLISH` | `error` |
 | **JetStream Publish** | `type: JETSTREAM_PUBLISH` + `stream` | `(*jetstream.PubAck, error)` |
 | **JetStream Consume** | `type: JETSTREAM_CONSUME` + `stream` | handler-only |
+| **Task + Rollback** | `type: JETSTREAM_TASK` + `stream` + `consumer` | `(*jetstream.PubAck, error)` |
 
 Subjects default to `{proto package}.{MethodName}` and can be overridden, including dynamic segments like `orders.{order_id}`. See the [Proto Definition Guide](./docs/proto-definition.md).
+
+## Tasks and Rollbacks
+
+A `JETSTREAM_TASK` is a unit of work with a paired undo. You declare it once
+and get three things: a client that triggers it, a worker that runs it, and a
+rollback that undoes it when it fails for good.
+
+```go
+// Worker — does the work
+func (w *payments) ChargeCard(ctx context.Context, req *shop.Charge, ack protonats.Acker) error {
+    return w.gateway.Charge(ctx, req.OrderId, req.AmountCents)
+}
+
+// Rollback — runs only after the task is given up on, and is told why
+func (r *orders) ChargeCard(ctx context.Context, req *shop.Charge, cause *protonats.Error, ack protonats.Acker) error {
+    return r.gateway.Refund(ctx, req.OrderId)
+}
+```
+
+The rollback's subject and consumer are derived from the task's, so the two
+halves cannot drift apart. Retries happen first: only once the retry policy
+gives up — or the consumer runs out of attempts — does the rollback fire.
+
+See [`examples/rollback`](./examples/rollback) for a runnable walkthrough.
 
 ## Scaling Out
 
